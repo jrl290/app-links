@@ -1221,23 +1221,25 @@ impl AppLinks {
             return;
         }
 
-        // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
-        // Do NOT use recv_timeout(LIVENESS_BUDGET) here.  LIVENESS_BUDGET is 5s,
-        // but link establishment timeout scales with hop count (6s × hops, up to
-        // ~78s for 12-hop paths).  A 5s cutoff abandons every multi-hop link
-        // before the transport's own timer can fire, causing all direct sends to
-        // distant peers to fail spuriously.
-        //
-        // The deterministic event here is the link's own established/closed
-        // callback, driven by the transport's per-hop timer.  We wait for it
-        // unconditionally; recv() returns Err only if both senders are dropped
-        // (actor panic), which we treat as failure.
-        let established_handle = match est_rx.recv() {
+        let established_handle = match est_rx.recv_timeout(LIVENESS_BUDGET) {
             Ok(Ok(h)) => h,
-            Ok(Err(())) | Err(_) => {
+            Ok(Err(())) => {
                 log(
                     &format!(
-                        "[APP_LINK] send tier-3: link closed/timed out before established for {}",
+                        "[APP_LINK] send tier-3: link closed before established for {}",
+                        hexrep(dest, false)
+                    ),
+                    LOG_NOTICE,
+                    false,
+                    false,
+                );
+                on_all_tiers_failed();
+                return;
+            }
+            Err(_) => {
+                log(
+                    &format!(
+                        "[APP_LINK] send tier-3: link establishment timed out for {}",
                         hexrep(dest, false)
                     ),
                     LOG_NOTICE,
