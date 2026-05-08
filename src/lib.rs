@@ -713,11 +713,28 @@ impl AppLinks {
         std::thread::Builder::new()
             .name("app_links_race".into())
             .spawn(move || {
-                // Expire any stale disk-cached path so race_path resolves via
-                // the relay that *currently* has a route to the destination.
-                // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
-                Transport::expire_path(&dest_owned);
-
+                // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1, §2
+                //
+                // Do NOT call expire_path() here.
+                //
+                // expire_path() sets the path timestamp to 0, which causes the
+                // transport cull to classify the entry as a same-as-new insert.
+                // If the only PATH_RESPONSE that comes back (e.g., from a remote
+                // relay) carries a worse hop count than the cached entry, the quality
+                // gate CANNOT reject it because expire_path() + cull has already
+                // deleted the cached entry (has_existing=false).  The result is that
+                // every chat-open can silently degrade a good 2-hop path to a 12-hop
+                // stale relay response, which then gets persisted to disk.
+                //
+                // expire_path() belongs in tier-3 of send(), AFTER tiers 1 and 2 have
+                // both failed.  At that point we have direct evidence the cached path
+                // is not working and forcing a fresh lookup is warranted.
+                //
+                // Here in appLinkOpen we use has_path fast-path: if a valid path
+                // already exists (from disk or a recent announce), return it
+                // immediately.  If not, fire PATH_REQ on all interfaces and wait for
+                // the best response, subject to LIVENESS_BUDGET.  The quality gate in
+                // the announce handler then guards against worse inbound paths.
                 let result = liveness::race_path(&dest_owned, LIVENESS_BUDGET);
 
                 let cbs: Vec<AppLinkStatusCallback> = REGISTRY
