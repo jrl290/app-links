@@ -1,0 +1,8 @@
+[package]
+name = "app_links"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+reticulum_rust = { path = "../Reticulum-rust" }
+once_cell = "1.19"

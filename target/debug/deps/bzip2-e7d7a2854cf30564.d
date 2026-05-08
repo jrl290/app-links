@@ -1,0 +1,11 @@
+/Users/james/Library/CloudStorage/SynologyDrive-Development/Rust/Reticulum/app-links/target/debug/deps/bzip2-e7d7a2854cf30564.d: /Users/james/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bzip2-0.4.4/src/lib.rs /Users/james/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bzip2-0.4.4/src/mem.rs /Users/james/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bzip2-0.4.4/src/bufread.rs /Users/james/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bzip2-0.4.4/src/read.rs /Users/james/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bzip2-0.4.4/src/write.rs
+
+/Users/james/Library/CloudStorage/SynologyDrive-Development/Rust/Reticulum/app-links/target/debug/deps/libbzip2-e7d7a2854cf30564.rlib: /Users/james/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bzip2-0.4.4/src/lib.rs /Users/james/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bzip2-0.4.4/src/mem.rs /Users/james/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bzip2-0.4.4/src/bufread.rs /Users/james/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bzip2-0.4.4/src/read.rs /Users/james/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bzip2-0.4.4/src/write.rs
+
+/Users/james/Library/CloudStorage/SynologyDrive-Development/Rust/Reticulum/app-links/target/debug/deps/libbzip2-e7d7a2854cf30564.rmeta: /Users/james/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bzip2-0.4.4/src/lib.rs /Users/james/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bzip2-0.4.4/src/mem.rs /Users/james/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bzip2-0.4.4/src/bufread.rs /Users/james/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bzip2-0.4.4/src/read.rs /Users/james/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bzip2-0.4.4/src/write.rs
+
+/Users/james/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bzip2-0.4.4/src/lib.rs:
+/Users/james/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bzip2-0.4.4/src/mem.rs:
+/Users/james/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bzip2-0.4.4/src/bufread.rs:
+/Users/james/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bzip2-0.4.4/src/read.rs:
+/Users/james/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bzip2-0.4.4/src/write.rs:
