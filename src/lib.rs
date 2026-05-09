@@ -34,10 +34,6 @@
 //! and fires `APP_LINK_ACTIVE(None)`.  **No link is built** by open.
 //! Links exist only while a tier-3 send is in progress or its resulting
 //! link is still cached (in `Registry.links`).
-//!
-//! Propagation-node destinations (aspect == "propagation") are the sole
-//! exception: they still build a persistent outbound Link so the LXMF
-//! propagation pull can reuse it.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -101,19 +97,18 @@ impl Default for LinkPolicy {
 /// changes.
 ///
 /// `(dest_hash, status, link)` — `link` is `Some(handle)` only when a
-/// real outbound `Link` is held in the registry (propagation destinations,
-/// or tier-3 just returned with an established handle).  For path-race
-/// open/status transitions it will be `None`.
+/// real outbound `Link` is held in the registry (tier-3 just returned with
+/// an established handle). For path-race open/status transitions it will be
+/// `None`.
 pub type AppLinkStatusCallback = Arc<dyn Fn(&[u8], u8, Option<LinkHandle>) + Send + Sync>;
 
-/// Internal marker.  Kept as a type so call sites that pass a `mode`
-/// argument continue to compile.  The only variant that builds a persistent
-/// Link is the propagation-node path (aspect == "propagation"); all other
-/// destinations use path-race-only semantics.
+/// Internal marker. Kept as a type so call sites that pass a `mode`
+/// argument continue to compile. AppLinks is path-race-only; it does not
+/// build persistent infrastructure links.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum LinkMode {
     #[default]
-    PersistentLink,
+    PathRaceOnly,
 }
 
 /// Per-destination state held by the registry.
@@ -136,13 +131,13 @@ impl AppLinkSpec {
         Self {
             app_name: app_name.into(),
             aspects,
-            mode: LinkMode::PersistentLink,
+            mode: LinkMode::PathRaceOnly,
             attempt_in_flight: Arc::new(AtomicBool::new(false)),
             ever_established: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// Retained for call-site compatibility; mode is always `PersistentLink`.
+    /// Retained for call-site compatibility; mode is always path-race only.
     pub fn with_mode(
         app_name: impl Into<String>,
         aspects: Vec<String>,
@@ -301,10 +296,8 @@ impl AppLinks {
     /// No outbound `Link` is built by this call.  Links exist only during
     /// a tier-3 send (and are cached in the registry for tier-2 reuse).
     ///
-    /// Exception: destinations with aspect `"propagation"` still build and
-    /// hold a persistent outbound `Link` (needed for LXMF pull requests).
     pub fn open(dest_hash: &[u8], app_name: &str, aspects: &[&str]) {
-        Self::open_with_mode(dest_hash, app_name, aspects, LinkMode::PersistentLink);
+        Self::open_with_mode(dest_hash, app_name, aspects, LinkMode::PathRaceOnly);
     }
 
     /// Alias for [`Self::open`].
@@ -312,8 +305,8 @@ impl AppLinks {
         Self::open(dest_hash, app_name, aspects);
     }
 
-    /// Open an app link in `mode`.  `mode` is ignored for non-propagation
-    /// destinations (call-site compatibility only).
+    /// Open an app link in `mode`. `mode` is ignored; retained for call-site
+    /// compatibility only.
     pub fn open_with_mode(
         dest_hash: &[u8],
         app_name: &str,
@@ -600,11 +593,8 @@ impl AppLinks {
     /// The `attempt_in_flight` CAS gate collapses concurrent triggers into a
     /// single in-flight race.  After the race:
     ///
-    ///   * **Propagation destinations** (aspect == "propagation"): call
-    ///     `start_persistent_link` to build and hold a real outbound `Link`,
-    ///     matching the LXMF pull-request pattern.
-    ///   * **All other destinations**: mark READY, fire `APP_LINK_ACTIVE(None)`,
-    ///     release the gate.  No Link is built.
+    /// After a successful race, mark READY, fire `APP_LINK_ACTIVE(None)`,
+    /// and release the gate. No Link is built.
     fn establish(dest_hash: &[u8]) {
         if Self::policy() == LinkPolicy::Suspended {
             return;
@@ -642,9 +632,6 @@ impl AppLinks {
         let dest_owned = dest_hash.to_vec();
         let in_flight = spec.attempt_in_flight.clone();
         let ever_established = spec.ever_established.clone();
-        let app_name = spec.app_name.clone();
-        let aspects = spec.aspects.clone();
-
         std::thread::Builder::new()
             .name("app_links_race".into())
             .spawn(move || {
@@ -670,19 +657,7 @@ impl AppLinks {
                 // immediately.  If not, fire PATH_REQ on all interfaces and wait for
                 // the best response, subject to LIVENESS_BUDGET.  The quality gate in
                 // the announce handler then guards against worse inbound paths.
-                let is_propagation = aspects.contains(&"propagation".to_string());
-                let result = if is_propagation {
-                    // Propagation-node LRREQ depends on the relay having proven
-                    // bidirectional readiness in THIS process. A disk-cached
-                    // path is useful for chat-open debugging, but it is not a
-                    // server-ready signal for a persistent propagation link.
-                    // Require a fresh PATH_RESPONSE / announce before building
-                    // the Link and sending LRREQ.
-                    // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §5.
-                    liveness::race_path_verified_this_session(&dest_owned, LIVENESS_BUDGET)
-                } else {
-                    liveness::race_path(&dest_owned, LIVENESS_BUDGET)
-                };
+                let result = liveness::race_path(&dest_owned, LIVENESS_BUDGET);
 
                 let cbs: Vec<AppLinkStatusCallback> = REGISTRY
                     .lock()
@@ -715,26 +690,13 @@ impl AppLinks {
                             false,
                         );
 
-                        // Propagation destinations build a persistent Link so
-                        // LXMF pull requests can reuse it.  All others just
-                        // mark READY and fire ACTIVE(None).
-                        if is_propagation {
-                            Self::start_persistent_link(
-                                dest_owned,
-                                app_name,
-                                aspects,
-                                in_flight,
-                                cbs,
-                            );
-                        } else {
-                            in_flight.store(false, Ordering::Release);
-                            for cb in &cbs {
-                                // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
-                                // ACTIVE fires with None: no Link is held for non-propagation
-                                // destinations.  The send tier hierarchy in AppLinks::send
-                                // builds a Link only when needed (tier-3).
-                                cb(&dest_owned, APP_LINK_ACTIVE, None);
-                            }
+                        in_flight.store(false, Ordering::Release);
+                        for cb in &cbs {
+                            // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+                            // ACTIVE fires with None: no Link is held by AppLinks.
+                            // The send tier hierarchy in AppLinks::send builds a
+                            // Link only when needed (tier-3).
+                            cb(&dest_owned, APP_LINK_ACTIVE, None);
                         }
                     }
                     Err(e) => {
@@ -756,176 +718,6 @@ impl AppLinks {
                 }
             })
             .expect("failed to spawn app_links race thread");
-    }
-
-    /// Build and hold a persistent outbound `Link` for `dest`.
-    ///
-    /// Used by propagation-node destinations only.  The `in_flight` gate
-    /// stays armed until the link reaches `STATE_ACTIVE` or closes.
-    fn start_persistent_link(
-        dest: Vec<u8>,
-        app_name: String,
-        aspects: Vec<String>,
-        in_flight: Arc<AtomicBool>,
-        cbs: Vec<AppLinkStatusCallback>,
-    ) {
-        let identity = match Identity::recall(&dest) {
-            Some(id) => id,
-            None => {
-                log(
-                    &format!(
-                        "[APP_LINK] PersistentLink: no identity for {} → DISCONNECTED",
-                        hexrep(&dest, false)
-                    ),
-                    LOG_NOTICE,
-                    false,
-                    false,
-                );
-                in_flight.store(false, Ordering::Release);
-                for cb in &cbs {
-                    cb(&dest, APP_LINK_DISCONNECTED, None);
-                }
-                return;
-            }
-        };
-
-        let destination = match Destination::new_outbound(
-            Some(identity),
-            DestinationType::Single,
-            app_name.clone(),
-            aspects.clone(),
-        ) {
-            Ok(d) => d,
-            Err(e) => {
-                log(
-                    &format!(
-                        "[APP_LINK] PersistentLink: new_outbound failed for {}: {}",
-                        hexrep(&dest, false),
-                        e
-                    ),
-                    LOG_NOTICE,
-                    false,
-                    false,
-                );
-                in_flight.store(false, Ordering::Release);
-                for cb in &cbs {
-                    cb(&dest, APP_LINK_DISCONNECTED, None);
-                }
-                return;
-            }
-        };
-
-        let link = match Link::new_outbound(destination, MODE_AES256_CBC) {
-            Ok(l) => l,
-            Err(e) => {
-                log(
-                    &format!(
-                        "[APP_LINK] PersistentLink: Link::new_outbound failed for {}: {}",
-                        hexrep(&dest, false),
-                        e
-                    ),
-                    LOG_NOTICE,
-                    false,
-                    false,
-                );
-                in_flight.store(false, Ordering::Release);
-                for cb in &cbs {
-                    cb(&dest, APP_LINK_DISCONNECTED, None);
-                }
-                return;
-            }
-        };
-
-        let handle = LinkHandle::spawn(link);
-
-        {
-            let dest_cb = dest.clone();
-            let in_flight_cb = in_flight.clone();
-            let cbs_cb = cbs.clone();
-            handle.set_link_established_callback(Some(Arc::new(move |h: LinkHandle| {
-                log(
-                    &format!(
-                        "[APP_LINK] PersistentLink ACTIVE for {}",
-                        hexrep(&dest_cb, false)
-                    ),
-                    LOG_NOTICE,
-                    false,
-                    false,
-                );
-                in_flight_cb.store(false, Ordering::Release);
-                for cb in &cbs_cb {
-                    cb(&dest_cb, APP_LINK_ACTIVE, Some(h.clone()));
-                }
-            })));
-        }
-
-        {
-            let dest_cb = dest.clone();
-            let in_flight_cb = in_flight.clone();
-            let cbs_cb = cbs.clone();
-            handle.set_link_closed_callback(Some(Arc::new(move |_: LinkHandle| {
-                let dropped = {
-                    let mut reg =
-                        REGISTRY.lock().expect("app_links registry mutex poisoned");
-                    reg.ready.remove(&dest_cb);
-                    reg.links.remove(&dest_cb)
-                };
-                drop(dropped);
-                in_flight_cb.store(false, Ordering::Release);
-                log(
-                    &format!(
-                        "[APP_LINK] PersistentLink CLOSED for {}",
-                        hexrep(&dest_cb, false)
-                    ),
-                    LOG_NOTICE,
-                    false,
-                    false,
-                );
-                for cb in &cbs_cb {
-                    cb(&dest_cb, APP_LINK_DISCONNECTED, None);
-                }
-                // Do NOT re-establish here. Link closure is the deterministic
-                // failure event for this persistent-link cycle; immediately
-                // spawning another `establish` is an application-level retry.
-                // A later fresh announce / PATH_RESPONSE may trigger a new
-                // cycle via `announce_received`, but this callback must only
-                // surface DISCONNECTED.
-                // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §3.
-            })));
-        }
-
-        {
-            let mut reg = REGISTRY.lock().expect("app_links registry mutex poisoned");
-            reg.links.insert(dest.clone(), handle.clone());
-        }
-
-        for cb in &cbs {
-            cb(&dest, APP_LINK_ESTABLISHING, Some(handle.clone()));
-        }
-
-        let dest_thread = dest.clone();
-        std::thread::Builder::new()
-            .name("app_links_link_initiate".into())
-            .spawn(move || {
-                // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
-                // Refresh the tunnel binding on every TCP backbone before
-                // sending the LRREQ so stale tunnel entries don't silently
-                // drop the LINK_PROOF.
-                Transport::synthesize_tunnel_all_tcp();
-                if let Err(e) = handle.initiate() {
-                    log(
-                        &format!(
-                            "[APP_LINK] PersistentLink initiate failed for {}: {:?}",
-                            hexrep(&dest_thread, false),
-                            e
-                        ),
-                        LOG_NOTICE,
-                        false,
-                        false,
-                    );
-                }
-            })
-            .expect("failed to spawn app_links link-initiate thread");
     }
 
     // ─── Three-tier send ──────────────────────────────────────────────
@@ -1736,36 +1528,32 @@ mod tests {
     }
 
     #[test]
-    fn propagation_open_requires_session_verified_path() {
-        let src = include_str!("lib.rs");
-        assert!(
-            src.contains("race_path_verified_this_session(&dest_owned, LIVENESS_BUDGET)"),
-            "propagation AppLinks establishment must require a current-session PATH_RESPONSE / announce before LRREQ"
-        );
-        assert!(
-            src.contains("Transport::wait_for_path_verified_this_session(dest_hash, budget)"),
-            "verified propagation path-race must wake from the transport path-added event, not a sleep-poll loop"
-        );
-    }
-
-    #[test]
-    fn persistent_link_close_does_not_auto_reopen() {
+    fn propagation_open_is_path_race_only() {
         let src = include_str!("lib.rs");
         let production = src
             .split("#[cfg(test)]")
             .next()
             .expect("production source prefix must exist");
-        let close_log = production
-            .find("[APP_LINK] PersistentLink CLOSED")
-            .expect("persistent close callback must remain present");
-        let tail = &production[close_log..];
-        let next_section = tail
-            .find("{\n            let mut reg = REGISTRY")
-            .unwrap_or(tail.len());
-        let close_callback = &tail[..next_section];
         assert!(
-            !close_callback.contains("AppLinks::establish"),
-            "PersistentLink CLOSED callback must surface DISCONNECTED, not retry by calling establish"
+            !production.contains("race_path_verified_this_session(&dest_owned, LIVENESS_BUDGET)"),
+            "AppLinks must not special-case propagation destinations"
+        );
+        assert!(
+            !production.contains("start_persistent_link"),
+            "AppLinks must not build persistent infrastructure links"
+        );
+    }
+
+    #[test]
+    fn app_links_has_no_persistent_link_close_loop() {
+        let src = include_str!("lib.rs");
+        let production = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source prefix must exist");
+        assert!(
+            !production.contains("PersistentLink"),
+            "AppLinks must not own persistent infrastructure-link close handling"
         );
         assert!(
             !production.contains("app_links_reestablish"),
