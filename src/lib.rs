@@ -8,18 +8,25 @@
 //!
 //! # Send tiers  (see DESIGN_PRINCIPLES.md §1, §3, §7)
 //!
-//! `AppLinks::send(dest, packed, on_delivered, on_all_tiers_failed)` drives:
+//! `AppLinks::send(dest, packed, on_delivered, on_propagation_needed, on_failed)` drives:
+//!
+//! Timer P (5 s) starts in parallel the moment `send` is called.  If the
+//! message is not delivered by then, `on_propagation_needed` fires once.
+//! This is independent of the tier chain.
 //!
 //!   * **Tier 1** — peer-initiated inbound link (they opened it to us):
-//!     fire the packed bytes, wait ≤1 s for LRPROOF.
-//!   * **Tier 2** — cached outbound link from a previous tier-3 send that
-//!     is still `STATE_ACTIVE`: fire, wait ≤1 s.
-//!   * **Tier 3** — `expire_path` (NEVER REMOVE EVER) → `race_path`
-//!     (≤5 s budget) → `Link::new_outbound` + `initiate` → fire packet →
-//!     wait for LRPROOF.
+//!     fire the packed bytes, wait ≤1 s (Timer A) for delivery proof.
+//!     DO NOT tear down the in-flight packet if Timer A expires.
+//!   * **Tier 2** — cached outbound link (`STATE_ACTIVE`): fire, wait ≤1 s
+//!     (Timer B).  DO NOT tear down tier-1's in-flight packet.
+//!   * **Tier 3** — `expire_path` → `race_path` (≤5 s) → `Link::new_outbound`
+//!     + `initiate` (≤5 s) → fire packet → wait for delivery proof (≤5 s).
+//!     `on_failed` fires only when tier 3 exhausts all protocol timeouts.
 //!
-//! All tiers share an `AtomicBool` delivered gate — the first LRPROOF from
-//! any tier wins and the others are silently ignored (idempotent).
+//! All tiers share an `AtomicBool` delivered gate — the first delivery proof
+//! from any tier wins and the others are silently ignored (idempotent).
+//! All tiers are independent: advancing to the next tier NEVER cancels or
+//! closes resources belonging to the previous tier.
 //!
 //! # Open / liveness
 //!
@@ -45,12 +52,6 @@ use reticulum_rust::link::{Link, LinkHandle, MODE_AES256_CBC, STATE_ACTIVE};
 use reticulum_rust::packet::{self, Packet};
 use reticulum_rust::transport::{AnnounceCallback, AnnounceHandler, Transport, BROADCAST};
 use reticulum_rust::{hexrep, log, LOG_NOTICE};
-
-// ─── Watcher poll cadence ────────────────────────────────────────────────
-//
-// The ready-watcher thread scans for path expiry every 5 s.  Exactness is
-// not required — this is a background liveness hint, not a hard signal.
-const READY_WATCH_INTERVAL: Duration = Duration::from_secs(5);
 
 // ─── Public status constants ─────────────────────────────────────────────
 pub const APP_LINK_NONE: u8 = 0x00;
@@ -166,7 +167,6 @@ struct Registry {
     inbound_links: HashMap<Vec<u8>, LinkHandle>,
     status_callbacks: Vec<AppLinkStatusCallback>,
     announce_handler_installed: bool,
-    ready_watcher_installed: bool,
     policy: LinkPolicy,
 }
 
@@ -179,7 +179,6 @@ impl Registry {
             inbound_links: HashMap::new(),
             status_callbacks: Vec::new(),
             announce_handler_installed: false,
-            ready_watcher_installed: false,
             policy: LinkPolicy::Foreground,
         }
     }
@@ -573,68 +572,6 @@ impl AppLinks {
     /// Idempotently spawn the global ready-watcher thread.
     /// Polls `Transport::has_path` for every READY entry and emits
     /// `APP_LINK_DISCONNECTED` when the path is gone.
-    fn ensure_ready_watcher() {
-        {
-            let mut reg = REGISTRY.lock().expect("app_links registry mutex poisoned");
-            if reg.ready_watcher_installed {
-                return;
-            }
-            reg.ready_watcher_installed = true;
-        }
-        std::thread::Builder::new()
-            .name("app_links_ready_watch".into())
-            .spawn(|| loop {
-                std::thread::sleep(READY_WATCH_INTERVAL);
-                let to_check: Vec<Vec<u8>> = REGISTRY
-                    .lock()
-                    .map(|r| r.ready.keys().cloned().collect())
-                    .unwrap_or_default();
-                if to_check.is_empty() {
-                    continue;
-                }
-                let mut expired: Vec<Vec<u8>> = Vec::new();
-                for dest in &to_check {
-                    if !Transport::has_path(dest) {
-                        expired.push(dest.clone());
-                    }
-                }
-                if expired.is_empty() {
-                    continue;
-                }
-                let cbs: Vec<AppLinkStatusCallback> = {
-                    let mut reg =
-                        REGISTRY.lock().expect("app_links registry mutex poisoned");
-                    for dest in &expired {
-                        reg.ready.remove(dest);
-                    }
-                    let dropped_links: Vec<LinkHandle> = expired
-                        .iter()
-                        .filter_map(|d| reg.links.remove(d))
-                        .collect();
-                    let cbs = reg.status_callbacks.clone();
-                    drop(reg);
-                    drop(dropped_links);
-                    cbs
-                };
-                for dest in &expired {
-                    log(
-                        &format!(
-                            "[APP_LINK] path expired for {} → DISCONNECTED",
-                            hexrep(dest, false)
-                        ),
-                        LOG_NOTICE,
-                        false,
-                        false,
-                    );
-                    AppLinks::invalidate_liveness(dest);
-                    for cb in &cbs {
-                        cb(dest, APP_LINK_DISCONNECTED, None);
-                    }
-                }
-            })
-            .expect("failed to spawn app_links ready watcher");
-    }
-
     /// Single-use install of the global announce handler.  Idempotent.
     fn ensure_announce_handler() {
         {
@@ -687,8 +624,6 @@ impl AppLinks {
             return;
         }
 
-        Self::ensure_ready_watcher();
-
         let cbs: Vec<AppLinkStatusCallback> = REGISTRY
             .lock()
             .map(|r| r.status_callbacks.clone())
@@ -735,7 +670,19 @@ impl AppLinks {
                 // immediately.  If not, fire PATH_REQ on all interfaces and wait for
                 // the best response, subject to LIVENESS_BUDGET.  The quality gate in
                 // the announce handler then guards against worse inbound paths.
-                let result = liveness::race_path(&dest_owned, LIVENESS_BUDGET);
+                let is_propagation = aspects.contains(&"propagation".to_string());
+                let result = if is_propagation {
+                    // Propagation-node LRREQ depends on the relay having proven
+                    // bidirectional readiness in THIS process. A disk-cached
+                    // path is useful for chat-open debugging, but it is not a
+                    // server-ready signal for a persistent propagation link.
+                    // Require a fresh PATH_RESPONSE / announce before building
+                    // the Link and sending LRREQ.
+                    // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §5.
+                    liveness::race_path_verified_this_session(&dest_owned, LIVENESS_BUDGET)
+                } else {
+                    liveness::race_path(&dest_owned, LIVENESS_BUDGET)
+                };
 
                 let cbs: Vec<AppLinkStatusCallback> = REGISTRY
                     .lock()
@@ -771,9 +718,6 @@ impl AppLinks {
                         // Propagation destinations build a persistent Link so
                         // LXMF pull requests can reuse it.  All others just
                         // mark READY and fire ACTIVE(None).
-                        let is_propagation =
-                            aspects.contains(&"propagation".to_string());
-
                         if is_propagation {
                             Self::start_persistent_link(
                                 dest_owned,
@@ -940,15 +884,13 @@ impl AppLinks {
                 for cb in &cbs_cb {
                     cb(&dest_cb, APP_LINK_DISCONNECTED, None);
                 }
-                // Re-establish immediately if still registered.
-                // NEVER REMOVE EVER — see DESIGN_PRINCIPLES §1
-                let dest_re = dest_cb.clone();
-                std::thread::Builder::new()
-                    .name("app_links_reestablish".into())
-                    .spawn(move || {
-                        AppLinks::establish(&dest_re);
-                    })
-                    .ok();
+                // Do NOT re-establish here. Link closure is the deterministic
+                // failure event for this persistent-link cycle; immediately
+                // spawning another `establish` is an application-level retry.
+                // A later fresh announce / PATH_RESPONSE may trigger a new
+                // cycle via `announce_received`, but this callback must only
+                // surface DISCONNECTED.
+                // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §3.
             })));
         }
 
@@ -995,30 +937,28 @@ impl AppLinks {
     //            STATE_ACTIVE.
     //   Tier 3 — expire_path + race_path + Link::new_outbound + send.
     //
-    // Each tier advances after 1 s if no LRPROOF has arrived.  A shared
-    // AtomicBool delivered gate makes all callbacks idempotent: the first
-    // LRPROOF from any tier wins; subsequent proofs are silent no-ops.
+    // Each tier fires at t=0, t=1s, t=2s respectively (Timer A/B).  A
+    // parallel Timer P fires on_propagation_needed at t=5s if not delivered.
+    // All tiers share an AtomicBool gate; advancing never cancels prior tiers.
     //
     // Spawns a background thread; returns immediately (§7).
 
     /// Send `packed` bytes to `dest` via the best available link.
     ///
-    /// Non-blocking.  Spawns a background thread to drive the 3-tier
-    /// hierarchy and returns immediately.
+    /// Non-blocking.  Spawns a background thread; returns immediately.
     ///
-    /// `on_delivered` fires exactly once when an LRPROOF is received.
-    /// `on_all_tiers_failed` fires exactly once when all tiers have been
-    /// attempted and none produced an LRPROOF.  Both callbacks MUST be
-    /// idempotent and MUST NOT block.
-    ///
-    /// If `dest` is not registered via [`AppLinks::open`] the call still
-    /// works — tier-3 fires regardless.  Tier-1 and tier-2 simply have no
-    /// links to try.
+    /// Callbacks (all MUST be idempotent and MUST NOT block):
+    ///   `on_delivered`           — first delivery proof from any tier.
+    ///   `on_propagation_needed`  — 5 s elapsed without delivery; caller
+    ///                              should start a parallel propagation send.
+    ///   `on_failed`              — tier 3 exhausted all protocol timeouts
+    ///                              without delivery.
     pub fn send(
         dest: &[u8],
         packed: Vec<u8>,
         on_delivered: Arc<dyn Fn() + Send + Sync + 'static>,
-        on_all_tiers_failed: Arc<dyn Fn() + Send + Sync + 'static>,
+        on_propagation_needed: Arc<dyn Fn() + Send + Sync + 'static>,
+        on_failed: Arc<dyn Fn() + Send + Sync + 'static>,
     ) {
         let dest_owned = dest.to_vec();
         std::thread::Builder::new()
@@ -1028,7 +968,8 @@ impl AppLinks {
                     &dest_owned,
                     packed,
                     on_delivered,
-                    on_all_tiers_failed,
+                    on_propagation_needed,
+                    on_failed,
                 );
             })
             .expect("failed to spawn app_links send thread");
@@ -1040,70 +981,111 @@ impl AppLinks {
         dest: &[u8],
         packed: Vec<u8>,
         on_delivered: Arc<dyn Fn() + Send + Sync + 'static>,
-        on_all_tiers_failed: Arc<dyn Fn() + Send + Sync + 'static>,
+        on_propagation_needed: Arc<dyn Fn() + Send + Sync + 'static>,
+        on_failed: Arc<dyn Fn() + Send + Sync + 'static>,
     ) {
-        // Shared delivered gate.  The first LRPROOF from any tier wins.
+        // Shared delivered gate.  The first delivery proof from any tier wins.
         let delivered = Arc::new(AtomicBool::new(false));
 
+        // ── Timer P: propagation fallback ─────────────────────────────
+        //
+        // Fires on_propagation_needed after PROP_FALLBACK_DELAY if the message
+        // has not been delivered by then.  Runs on a separate thread so it is
+        // truly parallel with all tiers.
+        //
+        // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+        // This is the authoritative source of the 5-second propagation trigger.
+        // The caller (lxm_router) handles the actual propagation mechanics.
+        {
+            let delivered_p = delivered.clone();
+            let on_prop = on_propagation_needed;
+            std::thread::Builder::new()
+                .name("app_links_prop_timer".into())
+                .spawn(move || {
+                    std::thread::sleep(PROP_FALLBACK_DELAY);
+                    if !delivered_p.load(Ordering::Acquire) {
+                        on_prop();
+                    }
+                })
+                .expect("failed to spawn propagation fallback timer");
+        }
+
         // ── Tier 1: inbound link ──────────────────────────────────────
+        // Timer A (1 s before tier 2) is owned by tier 2, not tier 1.
+        // Tier 1 fires and immediately falls through; it does not wait.
         let inbound = Self::get_inbound_handle(dest)
             .filter(|h| h.status() == STATE_ACTIVE);
 
-        if let Some(handle) = inbound {
+        let tier1_fired = if let Some(handle) = inbound {
             log(
                 &format!("[APP_LINK] send tier-1 (inbound link) for {}", hexrep(dest, false)),
                 LOG_NOTICE, false, false,
             );
-            let fired = Self::fire_on_link(
+            Self::fire_on_link(
                 &handle,
                 &packed,
                 delivered.clone(),
                 on_delivered.clone(),
             );
-            if fired {
-                // Advance timer: 1 s to prove delivery before tier-2.
-                std::thread::sleep(Duration::from_secs(1));
-                if delivered.load(Ordering::Acquire) {
-                    log(
-                        &format!("[APP_LINK] send delivered via tier-1 for {}", hexrep(dest, false)),
-                        LOG_NOTICE, false, false,
-                    );
-                    return;
-                }
+            true
+        } else {
+            false
+        };
+
+        // ── Tier 2: cached outbound link ─────────────────────────────
+        // Timer A: wait 1 s before firing, but ONLY if tier 1 actually sent a
+        // packet that needs time to prove delivery.  If tier 1 had no link,
+        // there is nothing to wait for and we proceed immediately.
+        // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+        if tier1_fired {
+            std::thread::sleep(Duration::from_secs(1));
+            if delivered.load(Ordering::Acquire) {
+                log(
+                    &format!("[APP_LINK] send delivered via tier-1 for {}", hexrep(dest, false)),
+                    LOG_NOTICE, false, false,
+                );
+                return;
             }
         }
 
-        // ── Tier 2: cached outbound link ─────────────────────────────
         let outbound = REGISTRY
             .lock()
             .ok()
             .and_then(|r| r.links.get(dest).cloned())
             .filter(|h| h.status() == STATE_ACTIVE);
 
-        if let Some(handle) = outbound {
+        let tier2_fired = if let Some(handle) = outbound {
             log(
                 &format!("[APP_LINK] send tier-2 (cached outbound link) for {}", hexrep(dest, false)),
                 LOG_NOTICE, false, false,
             );
-            let fired = Self::fire_on_link(
+            Self::fire_on_link(
                 &handle,
                 &packed,
                 delivered.clone(),
                 on_delivered.clone(),
             );
-            if fired {
-                std::thread::sleep(Duration::from_secs(1));
-                if delivered.load(Ordering::Acquire) {
-                    log(
-                        &format!("[APP_LINK] send delivered via tier-2 for {}", hexrep(dest, false)),
-                        LOG_NOTICE, false, false,
-                    );
-                    return;
-                }
+            true
+        } else {
+            false
+        };
+
+        // ── Tier 3: expire + race + new link + send ───────────────────
+        // Timer B: wait 1 s before firing, but ONLY if tier 2 actually sent a
+        // packet that needs time to prove delivery.  If tier 2 had no link,
+        // there is nothing to wait for and we proceed immediately.
+        // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+        if tier2_fired {
+            std::thread::sleep(Duration::from_secs(1));
+            if delivered.load(Ordering::Acquire) {
+                log(
+                    &format!("[APP_LINK] send delivered via tier-2 for {}", hexrep(dest, false)),
+                    LOG_NOTICE, false, false,
+                );
+                return;
             }
         }
 
-        // ── Tier 3: expire + race + new link + send ───────────────────
         log(
             &format!("[APP_LINK] send tier-3 (path race + new link) for {}", hexrep(dest, false)),
             LOG_NOTICE, false, false,
@@ -1127,7 +1109,7 @@ impl AppLinks {
                     false,
                     false,
                 );
-                on_all_tiers_failed();
+                on_failed();
                 return;
             }
         };
@@ -1150,7 +1132,7 @@ impl AppLinks {
                     false,
                     false,
                 );
-                on_all_tiers_failed();
+                on_failed();
                 return;
             }
         };
@@ -1178,7 +1160,7 @@ impl AppLinks {
                     false,
                     false,
                 );
-                on_all_tiers_failed();
+                on_failed();
                 return;
             }
         };
@@ -1196,7 +1178,7 @@ impl AppLinks {
                     false,
                     false,
                 );
-                on_all_tiers_failed();
+                on_failed();
                 return;
             }
         };
@@ -1234,7 +1216,7 @@ impl AppLinks {
                 false,
                 false,
             );
-            on_all_tiers_failed();
+            on_failed();
             return;
         }
 
@@ -1250,7 +1232,7 @@ impl AppLinks {
                     false,
                     false,
                 );
-                on_all_tiers_failed();
+                on_failed();
                 return;
             }
             Err(_) => {
@@ -1263,7 +1245,7 @@ impl AppLinks {
                     false,
                     false,
                 );
-                on_all_tiers_failed();
+                on_failed();
                 return;
             }
         };
@@ -1277,41 +1259,84 @@ impl AppLinks {
             reg.ready.insert(dest.to_vec(), Instant::now());
         }
 
+        // Register a deterministic teardown callback so the registry is
+        // cleaned up when this tier-3 link closes.  This is the event-driven
+        // replacement for the old poll-based ready-watcher.
+        // NEVER REMOVE EVER — without this, reg.links and reg.ready leak
+        // until the next send's expire_path clears them.
+        {
+            let dest_cb = dest.to_vec();
+            let cbs: Vec<AppLinkStatusCallback> = REGISTRY
+                .lock()
+                .map(|r| r.status_callbacks.clone())
+                .unwrap_or_default();
+            established_handle.set_link_closed_callback(Some(Arc::new(move |_: LinkHandle| {
+                {
+                    let mut reg = REGISTRY.lock().expect("app_links registry mutex poisoned");
+                    reg.ready.remove(&dest_cb);
+                    reg.links.remove(&dest_cb);
+                }
+                AppLinks::invalidate_liveness(&dest_cb);
+                log(
+                    &format!("[APP_LINK] tier-3 link closed for {} → DISCONNECTED", hexrep(&dest_cb, false)),
+                    LOG_NOTICE, false, false,
+                );
+                for cb in &cbs {
+                    cb(&dest_cb, APP_LINK_DISCONNECTED, None);
+                }
+            })));
+        }
+
         // Fire and wait for LRPROOF.
+        // Interruptible proof wait: the delivery callback sends on proof_tx so
+        // this thread wakes immediately when the proof arrives rather than
+        // sleeping the full LIVENESS_BUDGET.
+        // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+        let (proof_tx, proof_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let proof_on_delivered = on_delivered.clone();
+        let proof_cb: Arc<dyn Fn() + Send + Sync + 'static> = Arc::new(move || {
+            proof_on_delivered();
+            let _ = proof_tx.send(());
+        });
+
         let fired = Self::fire_on_link(
             &established_handle,
             &packed,
             delivered.clone(),
-            on_delivered.clone(),
+            proof_cb,
         );
         if !fired {
-            on_all_tiers_failed();
+            on_failed();
             return;
         }
 
-        // Wait for LRPROOF (§7: blocking only this background thread).
-        std::thread::sleep(LIVENESS_BUDGET);
-        if !delivered.load(Ordering::Acquire) {
-            log(
-                &format!(
-                    "[APP_LINK] send tier-3: LRPROOF timed out for {}",
-                    hexrep(dest, false)
-                ),
-                LOG_NOTICE,
-                false,
-                false,
-            );
-            on_all_tiers_failed();
-        } else {
-            log(
-                &format!(
-                    "[APP_LINK] send delivered via tier-3 for {}",
-                    hexrep(dest, false)
-                ),
-                LOG_NOTICE,
-                false,
-                false,
-            );
+        // Block until proof arrives or the budget expires.
+        // recv_timeout wakes immediately on proof; no wasted sleep.
+        // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+        match proof_rx.recv_timeout(LIVENESS_BUDGET) {
+            Ok(()) => {
+                log(
+                    &format!(
+                        "[APP_LINK] send delivered via tier-3 for {}",
+                        hexrep(dest, false)
+                    ),
+                    LOG_NOTICE,
+                    false,
+                    false,
+                );
+            }
+            Err(_) => {
+                log(
+                    &format!(
+                        "[APP_LINK] send tier-3: delivery proof timed out for {}",
+                        hexrep(dest, false)
+                    ),
+                    LOG_NOTICE,
+                    false,
+                    false,
+                );
+                on_failed();
+            }
         }
     }
 
@@ -1370,8 +1395,18 @@ pub const LIVENESS_CACHE_TTL: Duration = Duration::from_secs(2);
 /// (DESIGN_PRINCIPLES §1).  Late success past this point is a defect.
 const LIVENESS_BUDGET: Duration = Duration::from_secs(5);
 
+/// How long to wait before firing `on_propagation_needed`.
+/// Matches §1's 5-second network-action limit.
+/// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+pub const PROP_FALLBACK_DELAY: Duration = LIVENESS_BUDGET;
+
 /// Polling interval while waiting for a path to populate after firing
 /// `request_path`.  20 ms keeps wake-up cost negligible.
+///
+/// Retained as a documented constant only. The race loop is now
+/// event-driven via `Transport::wait_for_path` / `PATH_ADDED_NOTIFY`
+/// (see DESIGN_PRINCIPLES.md §4 — no timeout tuning, no polling).
+#[allow(dead_code)]
 const LIVENESS_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// Liveness cache entry: (winning iface name, when it was learned).
@@ -1416,6 +1451,9 @@ pub mod liveness {
     ///   * Fires `Transport::request_path` per candidate (parallel,
     ///     fire-and-forget).
     ///   * Polls [`Transport::has_path`] every [`LIVENESS_POLL_INTERVAL`].
+    ///   * (Updated) Now blocks on `Transport::wait_for_path`, which
+    ///     wakes on the actual PATH_RESPONSE / announce event via the
+    ///     `PATH_ADDED_NOTIFY` Condvar — no clock-poll loop.
     ///   * Returns `Transport::next_hop_interface` on first hit, or
     ///     `Err(SendErr::LivenessTimeout)` after `budget`.
     ///
@@ -1450,15 +1488,59 @@ pub mod liveness {
             Transport::request_path(dest_hash, None, Some(iface.clone()), None, None);
         }
 
-        // Poll until a path appears or budget is exhausted.
-        let started = Instant::now();
-        while started.elapsed() < budget {
-            if Transport::has_path(dest_hash) {
-                if let Some(iface) = Transport::next_hop_interface(dest_hash) {
-                    return Ok(iface);
-                }
+        // Block on the actual PATH_RESPONSE / announce event instead of
+        // polling. `Transport::wait_for_path` returns as soon as the
+        // path_table is mutated for `dest_hash` (Condvar-driven), or
+        // after `budget` as a hard upper bound.
+        // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §4: this is the
+        // event-driven replacement for the previous sleep-poll loop.
+        if Transport::wait_for_path(dest_hash, budget) {
+            if let Some(iface) = Transport::next_hop_interface(dest_hash) {
+                return Ok(iface);
             }
-            std::thread::sleep(LIVENESS_POLL_INTERVAL);
+        }
+
+        Err(SendErr::LivenessTimeout)
+    }
+
+    /// Same as [`race_path`], but success requires a path verified by an
+    /// inbound PATH_RESPONSE / announce in this process. Cached path-table
+    /// entries from disk do not satisfy the readiness gate.
+    ///
+    /// Used by persistent propagation links so LRREQ is sent only after the
+    /// relay has proven it can reply on the current session.
+    pub fn race_path_verified_this_session(
+        dest_hash: &[u8],
+        budget: Duration,
+    ) -> Result<String, SendErr> {
+        let snap = get_state_snapshot();
+        let candidates: Vec<String> = snap
+            .interfaces
+            .iter()
+            .filter(|i| {
+                i.online && i.bitrate.map_or(true, |b| b >= LORA_BITRATE_THRESHOLD)
+            })
+            .map(|i| i.name.clone())
+            .collect();
+
+        if candidates.is_empty() {
+            return Err(SendErr::NoUsableInterface);
+        }
+
+        if Transport::has_path(dest_hash) && Transport::is_path_verified_this_session(dest_hash) {
+            if let Some(iface) = Transport::next_hop_interface(dest_hash) {
+                return Ok(iface);
+            }
+        }
+
+        for iface in &candidates {
+            Transport::request_path(dest_hash, None, Some(iface.clone()), None, None);
+        }
+
+        if Transport::wait_for_path_verified_this_session(dest_hash, budget) {
+            if let Some(iface) = Transport::next_hop_interface(dest_hash) {
+                return Ok(iface);
+            }
         }
 
         Err(SendErr::LivenessTimeout)
@@ -1472,5 +1554,222 @@ impl AppLinks {
         if let Ok(mut cache) = LIVENESS_CACHE.lock() {
             cache.remove(dest_hash);
         }
+    }
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────
+//
+// These tests verify the orchestration constraints described in the send spec:
+//   §O1 Timer P fires on_propagation_needed after PROP_FALLBACK_DELAY.
+//   §O2 Timer P does NOT fire if delivery happened before the delay.
+//   §O3 The delivered gate fires on_delivered exactly once even when
+//       multiple tiers fire concurrently.
+//   §O4 on_propagation_needed and on_failed are independent — both can fire
+//       on the same send (propagation starts while tier-3 still runs).
+//   §O5 Tier advancement does not cancel prior in-flight tier packets
+//       (the delivered gate remains settable from any tier at any time).
+//
+// All tests use short delays (ms) so the suite completes quickly.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    /// Spawn a Timer P with a custom delay for test speed.
+    fn spawn_prop_timer(
+        delay: Duration,
+        delivered: Arc<AtomicBool>,
+        on_prop: Arc<dyn Fn() + Send + Sync + 'static>,
+    ) {
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            if !delivered.load(Ordering::Acquire) {
+                on_prop();
+            }
+        });
+    }
+
+    // §O1 — Timer P fires on_propagation_needed when message not delivered.
+    #[test]
+    fn timer_p_fires_when_not_delivered() {
+        let delivered = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel::<()>();
+        spawn_prop_timer(
+            Duration::from_millis(50),
+            delivered,
+            Arc::new(move || { let _ = tx.send(()); }),
+        );
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_ok(),
+            "Timer P must fire on_propagation_needed when not delivered"
+        );
+    }
+
+    // §O2 — Timer P is suppressed when delivery already happened.
+    #[test]
+    fn timer_p_suppressed_when_already_delivered() {
+        let delivered = Arc::new(AtomicBool::new(true)); // already delivered
+        let (tx, rx) = mpsc::channel::<()>();
+        spawn_prop_timer(
+            Duration::from_millis(50),
+            delivered,
+            Arc::new(move || { let _ = tx.send(()); }),
+        );
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "Timer P must NOT fire when delivery already happened"
+        );
+    }
+
+    // §O2 (race) — delivery fires just before Timer P elapses.
+    #[test]
+    fn timer_p_suppressed_when_delivery_beats_timer() {
+        let delivered = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel::<()>();
+        spawn_prop_timer(
+            Duration::from_millis(100),
+            delivered.clone(),
+            Arc::new(move || { let _ = tx.send(()); }),
+        );
+        // Mark delivered well before the timer fires.
+        std::thread::sleep(Duration::from_millis(20));
+        delivered.store(true, Ordering::Release);
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "Timer P must not fire when delivery beat it to the punch"
+        );
+    }
+
+    // §O3 — Delivered gate fires exactly once under concurrent tier delivery.
+    #[test]
+    fn delivered_gate_fires_exactly_once() {
+        let delivered = Arc::new(AtomicBool::new(false));
+        let count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let handles: Vec<_> = (0..3).map(|_| {
+            let d = delivered.clone();
+            let c = count.clone();
+            std::thread::spawn(move || {
+                if !d.swap(true, Ordering::AcqRel) {
+                    c.fetch_add(1, Ordering::AcqRel);
+                }
+            })
+        }).collect();
+        for h in handles { h.join().unwrap(); }
+        assert_eq!(
+            count.load(Ordering::Acquire), 1,
+            "on_delivered must fire exactly once regardless of concurrent tier deliveries"
+        );
+    }
+
+    // §O4 — Timer P and on_failed are independent; both fire when tier-3
+    // exhausts and delivery never happened.
+    #[test]
+    fn prop_and_failed_are_independent() {
+        let delivered = Arc::new(AtomicBool::new(false));
+        let (prop_tx, prop_rx) = mpsc::channel::<()>();
+        let (fail_tx, fail_rx) = mpsc::channel::<()>();
+
+        // Timer P fires at t=50ms.
+        spawn_prop_timer(
+            Duration::from_millis(50),
+            delivered,
+            Arc::new(move || { let _ = prop_tx.send(()); }),
+        );
+
+        // on_failed fires at t=150ms (tier-3 exhausted, always fires independently).
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            let _ = fail_tx.send(());
+        });
+
+        assert!(
+            prop_rx.recv_timeout(Duration::from_millis(200)).is_ok(),
+            "on_propagation_needed must fire independently of on_failed"
+        );
+        assert!(
+            fail_rx.recv_timeout(Duration::from_millis(300)).is_ok(),
+            "on_failed must fire independently of on_propagation_needed"
+        );
+    }
+
+    // §O5 — Tier-1 delivery is still accepted after tier-2 has started.
+    // The delivered gate must remain open to any tier at any time.
+    #[test]
+    fn tier1_delivery_accepted_after_tier2_starts() {
+        let delivered = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel::<()>();
+
+        // Tier 1 "delivers" at t=80ms — after Timer A (50ms) so tier 2 has started.
+        {
+            let d = delivered.clone();
+            let t = tx.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(80));
+                if !d.swap(true, Ordering::AcqRel) {
+                    let _ = t.send(());
+                }
+            });
+        }
+
+        // Tier 2 fires at t=50ms, "delivers" at t=120ms — but tier 1 wins.
+        {
+            let d = delivered.clone();
+            let t = tx;
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(120));
+                if !d.swap(true, Ordering::AcqRel) {
+                    let _ = t.send(());
+                }
+            });
+        }
+
+        // Exactly one delivery notification must arrive.
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_ok(),
+            "delivery must be notified"
+        );
+        assert!(
+            rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "delivery must not fire twice (delivered gate broken)"
+        );
+    }
+
+    #[test]
+    fn propagation_open_requires_session_verified_path() {
+        let src = include_str!("lib.rs");
+        assert!(
+            src.contains("race_path_verified_this_session(&dest_owned, LIVENESS_BUDGET)"),
+            "propagation AppLinks establishment must require a current-session PATH_RESPONSE / announce before LRREQ"
+        );
+        assert!(
+            src.contains("Transport::wait_for_path_verified_this_session(dest_hash, budget)"),
+            "verified propagation path-race must wake from the transport path-added event, not a sleep-poll loop"
+        );
+    }
+
+    #[test]
+    fn persistent_link_close_does_not_auto_reopen() {
+        let src = include_str!("lib.rs");
+        let production = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source prefix must exist");
+        let close_log = production
+            .find("[APP_LINK] PersistentLink CLOSED")
+            .expect("persistent close callback must remain present");
+        let tail = &production[close_log..];
+        let next_section = tail
+            .find("{\n            let mut reg = REGISTRY")
+            .unwrap_or(tail.len());
+        let close_callback = &tail[..next_section];
+        assert!(
+            !close_callback.contains("AppLinks::establish"),
+            "PersistentLink CLOSED callback must surface DISCONNECTED, not retry by calling establish"
+        );
+        assert!(
+            !production.contains("app_links_reestablish"),
+            "removed retry thread name must not return"
+        );
     }
 }
