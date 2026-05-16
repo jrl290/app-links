@@ -1235,6 +1235,39 @@ impl AppLinks {
             .expect("failed to spawn app_links send thread");
     }
 
+    /// Send a plain DATA packet via an ephemeral app-link using the supplied
+    /// destination spec.
+    ///
+    /// Unlike [`Self::open`], this only registers the app/aspect mapping and
+    /// announce watch needed for tier-3 destination construction. The actual
+    /// path-race / link-establish / DATA send lifecycle remains owned by
+    /// [`Self::send`].
+    pub fn send_with_spec(
+        dest: &[u8],
+        app_name: &str,
+        aspects: &[&str],
+        packed: Vec<u8>,
+        on_delivered: Arc<dyn Fn() + Send + Sync + 'static>,
+        on_propagation_needed: Arc<dyn Fn() + Send + Sync + 'static>,
+        on_failed: Arc<dyn Fn() + Send + Sync + 'static>,
+    ) {
+        Self::ensure_announce_handler();
+
+        let spec = AppLinkSpec::with_mode(
+            app_name,
+            aspects.iter().map(|s| (*s).to_string()).collect(),
+            LinkMode::EphemeralLink,
+        );
+
+        {
+            let mut reg = REGISTRY.lock().expect("app_links registry mutex poisoned");
+            reg.specs.insert(dest.to_vec(), spec);
+        }
+
+        Transport::watch_announce(dest.to_vec());
+        Self::send(dest, packed, on_delivered, on_propagation_needed, on_failed);
+    }
+
     /// Drive the tier chain synchronously.  Runs on the background thread
     /// spawned by [`AppLinks::send`].
     fn run_tier_chain(
