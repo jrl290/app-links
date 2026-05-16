@@ -1,10 +1,58 @@
 //! App-link crate.
 //!
-//! Owns path-racing (liveness), the destination registry, and the
-//! three-tier send hierarchy for DIRECT LXMF delivery.
+//! Owns path-racing (liveness), the destination registry, the
+//! three-tier send hierarchy for DIRECT LXMF delivery, and an optional
+//! held-open outbound link mode for generic app destinations.
 //!
 //! Dependency chain: `lxmf-rust → app-links → reticulum-rust`
 //! (no cycles; this crate does NOT depend on lxmf-rust).
+//!
+//! # Mental Model
+//!
+//! AppLinks does not define a separate wire-level link type. In every case the
+//! transport primitive is still Reticulum's `LinkHandle`.
+//!
+//! The distinction is what AppLinks owns above that transport link.
+//!
+//! ## LXMF direct delivery
+//!
+//! For direct LXMF delivery, AppLinks is the send orchestrator.
+//!
+//! - It owns the three-tier DIRECT send flow.
+//! - It tracks peer-initiated inbound delivery links for reuse.
+//! - It fires the propagation fallback signal when direct delivery has not
+//!   completed within the required window.
+//!
+//! In this mode, AppLinks is deciding *how* to send, not just whether a link
+//! exists.
+//!
+//! ## Generic Reticulum app destinations
+//!
+//! For generic app destinations, AppLinks is mainly a liveness and lifecycle
+//! layer.
+//!
+//! - It watches readiness and announce state.
+//! - It opens either an `EphemeralLink` or a `Persistent` app-link lifecycle.
+//! - It may hand the caller an active persistent `LinkHandle`.
+//!
+//! The caller then owns the application protocol spoken over that link. The
+//! current `lxmf.propagation` flow is the reference example: AppLinks owns the
+//! persistent link, while `lxmf-rust` owns identify/request/response handling.
+//!
+//! ## `EphemeralLink`
+//!
+//! `EphemeralLink` is the lifecycle mode used by [`AppLinks::open`]. It races
+//! path readiness but does not hold an outbound link open merely because the
+//! destination was registered. An outbound link may still be created later by
+//! the tier-3 send path and cached for reuse, but AppLinks does not treat that
+//! as a long-lived owned session.
+//!
+//! ## `Persistent`
+//!
+//! `Persistent` is the lifecycle mode used by [`AppLinks::open_persistent`].
+//! AppLinks races path readiness, creates a real outbound link, and keeps that
+//! link in the registry until it closes or the destination is explicitly
+//! closed.
 //!
 //! # Send tiers  (see DESIGN_PRINCIPLES.md §1, §3, §7)
 //!
@@ -30,10 +78,12 @@
 //!
 //! # Open / liveness
 //!
-//! `AppLinks::open()` races a path (liveness), marks the destination READY
-//! and fires `APP_LINK_ACTIVE(None)`.  **No link is built** by open.
-//! Links exist only while a tier-3 send is in progress or its resulting
-//! link is still cached (in `Registry.links`).
+//! `AppLinks::open()` races a path (liveness), marks the destination READY,
+//! and fires `APP_LINK_ACTIVE(None)`.  **No link is built** by `open()`.
+//!
+//! `AppLinks::open_persistent()` uses the same path-race gate, then
+//! establishes and holds an outbound `LinkHandle` in `Registry.links`.
+//! The underlying `Link` actor owns keepalive and stale detection.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,7 +94,14 @@ use once_cell::sync::Lazy;
 
 use reticulum_rust::destination::{Destination, DestinationType};
 use reticulum_rust::identity::Identity;
-use reticulum_rust::link::{Link, LinkHandle, MODE_AES256_CBC, STATE_ACTIVE};
+use reticulum_rust::link::{
+    Link,
+    LinkHandle,
+    MODE_AES256_CBC,
+    STATE_ACTIVE,
+    STATE_HANDSHAKE,
+    STATE_PENDING,
+};
 use reticulum_rust::packet::{self, Packet};
 use reticulum_rust::transport::{AnnounceCallback, AnnounceHandler, Transport, BROADCAST};
 use reticulum_rust::{hexrep, log, LOG_NOTICE};
@@ -98,17 +155,16 @@ impl Default for LinkPolicy {
 ///
 /// `(dest_hash, status, link)` — `link` is `Some(handle)` only when a
 /// real outbound `Link` is held in the registry (tier-3 just returned with
-/// an established handle). For path-race open/status transitions it will be
+/// an established handle). For ephemeral-link open/status transitions it will be
 /// `None`.
 pub type AppLinkStatusCallback = Arc<dyn Fn(&[u8], u8, Option<LinkHandle>) + Send + Sync>;
 
-/// Internal marker. Kept as a type so call sites that pass a `mode`
-/// argument continue to compile. AppLinks is path-race-only; it does not
-/// build persistent infrastructure links.
+/// Per-destination lifecycle mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum LinkMode {
     #[default]
-    PathRaceOnly,
+    EphemeralLink,
+    Persistent,
 }
 
 /// Per-destination state held by the registry.
@@ -124,6 +180,11 @@ pub struct AppLinkSpec {
     /// True once this destination has reached READY/ACTIVE at least once
     /// since open.
     pub ever_established: Arc<AtomicBool>,
+    /// Arms a single deterministic close-triggered re-open for persistent
+    /// links. Re-armed by an explicit trigger (open/announce/network change)
+    /// or after a successful persistent establish. This prevents tight
+    /// close→open loops while still honoring persistent-link ownership.
+    pub reconnect_armed: Arc<AtomicBool>,
 }
 
 impl AppLinkSpec {
@@ -131,19 +192,26 @@ impl AppLinkSpec {
         Self {
             app_name: app_name.into(),
             aspects,
-            mode: LinkMode::PathRaceOnly,
+            mode: LinkMode::EphemeralLink,
             attempt_in_flight: Arc::new(AtomicBool::new(false)),
             ever_established: Arc::new(AtomicBool::new(false)),
+            reconnect_armed: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// Retained for call-site compatibility; mode is always path-race only.
     pub fn with_mode(
         app_name: impl Into<String>,
         aspects: Vec<String>,
-        _mode: LinkMode,
+        mode: LinkMode,
     ) -> Self {
-        Self::new(app_name, aspects)
+        Self {
+            app_name: app_name.into(),
+            aspects,
+            mode,
+            attempt_in_flight: Arc::new(AtomicBool::new(false)),
+            ever_established: Arc::new(AtomicBool::new(false)),
+            reconnect_armed: Arc::new(AtomicBool::new(mode == LinkMode::Persistent)),
+        }
     }
 }
 
@@ -185,6 +253,113 @@ static REGISTRY: Lazy<Mutex<Registry>> = Lazy::new(|| Mutex::new(Registry::new()
 pub struct AppLinks;
 
 impl AppLinks {
+    fn emit_status(dest_hash: &[u8], status: u8, link: Option<LinkHandle>) {
+        let cbs: Vec<AppLinkStatusCallback> = REGISTRY
+            .lock()
+            .map(|r| r.status_callbacks.clone())
+            .unwrap_or_default();
+        for cb in &cbs {
+            cb(dest_hash, status, link.clone());
+        }
+    }
+
+    fn persistent_requires_verified_session_path(spec: &AppLinkSpec) -> bool {
+        spec.app_name == "lxmf"
+            && spec.aspects.len() == 1
+            && spec.aspects[0] == "propagation"
+    }
+
+    fn outbound_link_live(dest_hash: &[u8]) -> bool {
+        Self::get_handle(dest_hash)
+            .map(|handle| {
+                let status = handle.status();
+                status == STATE_PENDING || status == STATE_HANDSHAKE || status == STATE_ACTIVE
+            })
+            .unwrap_or(false)
+    }
+
+    fn arm_reconnect_if_persistent(dest_hash: &[u8]) {
+        if let Some(spec) = Self::spec(dest_hash) {
+            if spec.mode == LinkMode::Persistent {
+                spec.reconnect_armed.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    fn consume_reconnect_arm(dest_hash: &[u8]) -> bool {
+        Self::spec(dest_hash)
+            .filter(|spec| spec.mode == LinkMode::Persistent)
+            .map(|spec| spec.reconnect_armed.swap(false, Ordering::AcqRel))
+            .unwrap_or(false)
+    }
+
+    pub fn get_preferred_handle(dest_hash: &[u8]) -> Option<LinkHandle> {
+        Self::get_handle(dest_hash)
+            .or_else(|| Self::get_inbound_handle(dest_hash))
+    }
+
+    fn remove_tracked_outbound_if_same(dest_hash: &[u8], closing: &LinkHandle) -> bool {
+        if let Ok(mut reg) = REGISTRY.lock() {
+            let should_remove = reg
+                .links
+                .get(dest_hash)
+                .map(|tracked| tracked.same_link(closing))
+                .unwrap_or(false);
+            if should_remove {
+                reg.links.remove(dest_hash);
+                reg.ready.remove(dest_hash);
+                return true;
+            }
+        }
+        false
+    }
+
+    fn remove_tracked_inbound_if_same(dest_hash: &[u8], closing: &LinkHandle) -> bool {
+        if let Ok(mut reg) = REGISTRY.lock() {
+            let should_remove = reg
+                .inbound_links
+                .get(dest_hash)
+                .map(|tracked| tracked.same_link(closing))
+                .unwrap_or(false);
+            if should_remove {
+                reg.inbound_links.remove(dest_hash);
+                return true;
+            }
+        }
+        false
+    }
+
+    fn handle_tracked_outbound_closed(dest_hash: Vec<u8>, closing: LinkHandle) {
+        let _ = Self::remove_tracked_outbound_if_same(&dest_hash, &closing);
+        Self::invalidate_liveness(&dest_hash);
+        log(
+            &format!(
+                "[APP_LINK] outbound link closed for {}",
+                hexrep(&dest_hash, false)
+            ),
+            LOG_NOTICE,
+            false,
+            false,
+        );
+        if Self::contains(&dest_hash) {
+            Self::emit_status(&dest_hash, APP_LINK_DISCONNECTED, None);
+            if Self::policy() == LinkPolicy::Foreground
+                && Self::consume_reconnect_arm(&dest_hash)
+            {
+                log(
+                    &format!(
+                        "[APP_LINK] persistent close trigger → re-open {}",
+                        hexrep(&dest_hash, false)
+                    ),
+                    LOG_NOTICE,
+                    false,
+                    false,
+                );
+                Self::request_reopen_internal(&dest_hash, false);
+            }
+        }
+    }
+
     // ─── Host integration ─────────────────────────────────────────────
 
     /// Subscribe to status changes.  Multiple callbacks are supported.
@@ -297,16 +472,19 @@ impl AppLinks {
     /// a tier-3 send (and are cached in the registry for tier-2 reuse).
     ///
     pub fn open(dest_hash: &[u8], app_name: &str, aspects: &[&str]) {
-        Self::open_with_mode(dest_hash, app_name, aspects, LinkMode::PathRaceOnly);
+        Self::open_with_mode(dest_hash, app_name, aspects, LinkMode::EphemeralLink);
     }
 
-    /// Alias for [`Self::open`].
+    /// Open a held-open outbound link for `dest_hash`.
+    ///
+    /// This still begins with a path-race, but once a path is found it
+    /// establishes an outbound `LinkHandle` and keeps that handle in the
+    /// registry until the link closes or [`Self::close`] is called.
     pub fn open_persistent(dest_hash: &[u8], app_name: &str, aspects: &[&str]) {
-        Self::open(dest_hash, app_name, aspects);
+        Self::open_with_mode(dest_hash, app_name, aspects, LinkMode::Persistent);
     }
 
-    /// Open an app link in `mode`. `mode` is ignored; retained for call-site
-    /// compatibility only.
+    /// Open an app link in `mode`.
     pub fn open_with_mode(
         dest_hash: &[u8],
         app_name: &str,
@@ -315,13 +493,14 @@ impl AppLinks {
     ) {
         Self::ensure_announce_handler();
 
+        let previous_status = Self::status(dest_hash);
+        let previous_outbound_live = Self::outbound_link_live(dest_hash);
+
         let spec = AppLinkSpec::with_mode(
             app_name,
             aspects.iter().map(|s| (*s).to_string()).collect(),
             mode,
         );
-
-        let als_before = Self::status(dest_hash);
 
         {
             let mut reg = REGISTRY.lock().expect("app_links registry mutex poisoned");
@@ -334,14 +513,54 @@ impl AppLinks {
             return;
         }
 
-        if als_before == APP_LINK_ACTIVE
-            || als_before == APP_LINK_ESTABLISHING
-            || als_before == APP_LINK_PATH_REQUESTED
-        {
-            return;
+        if mode == LinkMode::Persistent {
+            Self::arm_reconnect_if_persistent(dest_hash);
+        }
+
+        match mode {
+            LinkMode::EphemeralLink => {
+                if previous_status == APP_LINK_ACTIVE
+                    || previous_status == APP_LINK_ESTABLISHING
+                    || previous_status == APP_LINK_PATH_REQUESTED
+                {
+                    return;
+                }
+            }
+            LinkMode::Persistent => {
+                if previous_outbound_live
+                    || previous_status == APP_LINK_ESTABLISHING
+                    || previous_status == APP_LINK_PATH_REQUESTED
+                {
+                    return;
+                }
+            }
         }
 
         Self::establish(dest_hash);
+    }
+
+    /// Explicit deterministic re-open trigger for a registered app link.
+    ///
+    /// Used by host callbacks and close-trigger handling for persistent
+    /// links. This invalidates any cached liveness winner and runs the same
+    /// path-race/link-establish flow as `open_with_mode`, without adding any
+    /// timed retry loop.
+    fn request_reopen_internal(dest_hash: &[u8], arm_reconnect: bool) {
+        if !Self::contains(dest_hash) {
+            return;
+        }
+        if Self::policy() == LinkPolicy::Suspended {
+            return;
+        }
+        if arm_reconnect {
+            Self::arm_reconnect_if_persistent(dest_hash);
+        }
+        Self::invalidate_liveness(dest_hash);
+        Self::establish(dest_hash);
+    }
+
+    pub fn request_reopen(dest_hash: &[u8]) {
+        Self::request_reopen_internal(dest_hash, true);
     }
 
     /// Close an app link.  Removes from registry, drops any held link and
@@ -355,6 +574,12 @@ impl AppLinks {
             let di = reg.inbound_links.remove(dest_hash);
             (removed, dl, di)
         };
+        if let Some(handle) = &dropped_link {
+            handle.teardown();
+        }
+        if let Some(handle) = &dropped_inbound {
+            handle.teardown();
+        }
         drop(dropped_link);
         drop(dropped_inbound);
         if was_registered {
@@ -378,7 +603,7 @@ impl AppLinks {
     ///                                 OR a held link is `STATE_ACTIVE`.
     ///   * `APP_LINK_DISCONNECTED`   — registered, no path, no race.
     pub fn status(dest_hash: &[u8]) -> u8 {
-        let (registered, in_flight, link, in_ready) = {
+        let (registered, in_flight, link, inbound, in_ready) = {
             let reg = match REGISTRY.lock() {
                 Ok(g) => g,
                 Err(_) => return APP_LINK_NONE,
@@ -389,8 +614,9 @@ impl AppLinks {
                 .map(|s| s.attempt_in_flight.load(Ordering::Acquire))
                 .unwrap_or(false);
             let link = reg.links.get(dest_hash).cloned();
+            let inbound = reg.inbound_links.get(dest_hash).cloned();
             let in_ready = reg.ready.contains_key(dest_hash);
-            (registered, in_flight, link, in_ready)
+            (registered, in_flight, link, inbound, in_ready)
         };
         if !registered {
             return APP_LINK_NONE;
@@ -402,10 +628,15 @@ impl AppLinks {
             }
             return APP_LINK_ESTABLISHING;
         }
+        if let Some(handle) = inbound {
+            if handle.status() == STATE_ACTIVE {
+                return APP_LINK_ACTIVE;
+            }
+        }
         if in_flight {
             return APP_LINK_PATH_REQUESTED;
         }
-        // Path-race-only: ACTIVE when ready entry exists and path is still valid.
+        // EphemeralLink: ACTIVE when ready entry exists and path is still valid.
         if in_ready && Transport::has_path(dest_hash) {
             return APP_LINK_ACTIVE;
         }
@@ -433,10 +664,8 @@ impl AppLinks {
         }
         {
             let dest_owned = dest_hash.to_vec();
-            link.set_link_closed_callback(Some(Arc::new(move |_: LinkHandle| {
-                if let Ok(mut reg) = REGISTRY.lock() {
-                    reg.inbound_links.remove(&dest_owned);
-                }
+            link.set_link_closed_callback(Some(Arc::new(move |closing: LinkHandle| {
+                AppLinks::remove_tracked_inbound_if_same(&dest_owned, &closing);
                 log(
                     &format!(
                         "[APP_LINK] inbound link closed for {}",
@@ -492,7 +721,7 @@ impl AppLinks {
         if Self::status(dest_hash) == APP_LINK_ACTIVE {
             return;
         }
-        Self::establish(dest_hash);
+        Self::request_reopen(dest_hash);
     }
 
     /// Trigger one fresh attempt for every app-link not currently active.
@@ -521,41 +750,47 @@ impl AppLinks {
             false,
         );
         for dest in &candidates {
-            Self::invalidate_liveness(dest);
-            Self::establish(dest);
+            Self::request_reopen(dest);
         }
     }
 
     // ─── Internals ────────────────────────────────────────────────────
 
     fn clear_all_ready(notify: bool) {
-        let (dropped, dropped_links, dropped_inbound) = {
+        let (notify_direct, dropped_links, dropped_inbound) = {
             let mut reg = REGISTRY.lock().expect("app_links registry mutex poisoned");
             let ready_keys: Vec<Vec<u8>> = reg.ready.keys().cloned().collect();
             let link_keys: Vec<Vec<u8>> = reg.links.keys().cloned().collect();
+            let inbound_keys: Vec<Vec<u8>> = reg.inbound_links.keys().cloned().collect();
             reg.ready.clear();
             let dropped_links: Vec<LinkHandle> =
                 reg.links.drain().map(|(_, h)| h).collect();
             let dropped_inbound: Vec<LinkHandle> =
                 reg.inbound_links.drain().map(|(_, h)| h).collect();
-            let mut union: Vec<Vec<u8>> = ready_keys;
-            for k in link_keys {
-                if !union.contains(&k) {
-                    union.push(k);
+            let mut notify_direct = Vec::new();
+            for k in ready_keys.into_iter().chain(inbound_keys.into_iter()) {
+                if !link_keys.contains(&k) && !notify_direct.contains(&k) {
+                    notify_direct.push(k);
                 }
             }
-            (union, dropped_links, dropped_inbound)
+            (notify_direct, dropped_links, dropped_inbound)
         };
+        for handle in &dropped_links {
+            handle.teardown();
+        }
+        for handle in &dropped_inbound {
+            handle.teardown();
+        }
         drop(dropped_links);
         drop(dropped_inbound);
-        if !notify || dropped.is_empty() {
+        if !notify || notify_direct.is_empty() {
             return;
         }
         let cbs: Vec<AppLinkStatusCallback> = REGISTRY
             .lock()
             .map(|r| r.status_callbacks.clone())
             .unwrap_or_default();
-        for dest in &dropped {
+        for dest in &notify_direct {
             for cb in &cbs {
                 cb(dest, APP_LINK_DISCONNECTED, None);
             }
@@ -603,6 +838,10 @@ impl AppLinks {
             Some(s) => s,
             None => return,
         };
+        if spec.mode == LinkMode::Persistent {
+            Self::establish_persistent(dest_hash, spec);
+            return;
+        }
         if Self::status(dest_hash) == APP_LINK_ACTIVE {
             return;
         }
@@ -718,6 +957,235 @@ impl AppLinks {
                 }
             })
             .expect("failed to spawn app_links race thread");
+    }
+
+    fn establish_persistent(dest_hash: &[u8], spec: AppLinkSpec) {
+        if Self::policy() == LinkPolicy::Suspended {
+            return;
+        }
+        if Self::outbound_link_live(dest_hash) {
+            return;
+        }
+        if spec
+            .attempt_in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        Self::emit_status(dest_hash, APP_LINK_PATH_REQUESTED, None);
+        log(
+            &format!(
+                "[APP_LINK] persistent path-race trigger for {}",
+                hexrep(dest_hash, false)
+            ),
+            LOG_NOTICE,
+            false,
+            false,
+        );
+
+        let dest_owned = dest_hash.to_vec();
+        let app_name = spec.app_name.clone();
+        let aspects = spec.aspects.clone();
+        let spec_for_open = spec.clone();
+        std::thread::Builder::new()
+            .name("app_links_persistent_open".into())
+            .spawn(move || {
+                let iface = match if Self::persistent_requires_verified_session_path(&spec_for_open) {
+                    liveness::race_path_verified_this_session(&dest_owned, LIVENESS_BUDGET)
+                } else {
+                    liveness::race_path(&dest_owned, LIVENESS_BUDGET)
+                } {
+                    Ok(iface) => iface,
+                    Err(e) => {
+                        spec_for_open
+                            .attempt_in_flight
+                            .store(false, Ordering::Release);
+                        log(
+                            &format!(
+                                "[APP_LINK] persistent race failed for {}: {}",
+                                hexrep(&dest_owned, false),
+                                e
+                            ),
+                            LOG_NOTICE,
+                            false,
+                            false,
+                        );
+                        AppLinks::emit_status(&dest_owned, APP_LINK_DISCONNECTED, None);
+                        return;
+                    }
+                };
+
+                if let Ok(mut cache) = LIVENESS_CACHE.lock() {
+                    cache.insert(dest_owned.clone(), (iface.clone(), Instant::now()));
+                }
+
+                let identity = match Identity::recall(&dest_owned) {
+                    Some(id) => id,
+                    None => {
+                        spec_for_open
+                            .attempt_in_flight
+                            .store(false, Ordering::Release);
+                        log(
+                            &format!(
+                                "[APP_LINK] persistent open: no identity for {}",
+                                hexrep(&dest_owned, false)
+                            ),
+                            LOG_NOTICE,
+                            false,
+                            false,
+                        );
+                        AppLinks::emit_status(&dest_owned, APP_LINK_DISCONNECTED, None);
+                        return;
+                    }
+                };
+
+                let destination = match Destination::new_outbound(
+                    Some(identity),
+                    DestinationType::Single,
+                    app_name,
+                    aspects,
+                ) {
+                    Ok(destination) => destination,
+                    Err(e) => {
+                        spec_for_open
+                            .attempt_in_flight
+                            .store(false, Ordering::Release);
+                        log(
+                            &format!(
+                                "[APP_LINK] persistent open: destination build failed for {}: {}",
+                                hexrep(&dest_owned, false),
+                                e
+                            ),
+                            LOG_NOTICE,
+                            false,
+                            false,
+                        );
+                        AppLinks::emit_status(&dest_owned, APP_LINK_DISCONNECTED, None);
+                        return;
+                    }
+                };
+
+                let link = match Link::new_outbound(destination, MODE_AES256_CBC) {
+                    Ok(link) => link,
+                    Err(e) => {
+                        spec_for_open
+                            .attempt_in_flight
+                            .store(false, Ordering::Release);
+                        log(
+                            &format!(
+                                "[APP_LINK] persistent open: Link::new_outbound failed for {}: {}",
+                                hexrep(&dest_owned, false),
+                                e
+                            ),
+                            LOG_NOTICE,
+                            false,
+                            false,
+                        );
+                        AppLinks::emit_status(&dest_owned, APP_LINK_DISCONNECTED, None);
+                        return;
+                    }
+                };
+
+                let handle = LinkHandle::spawn(link);
+                if let Ok(mut reg) = REGISTRY.lock() {
+                    reg.ready.remove(&dest_owned);
+                    reg.links.insert(dest_owned.clone(), handle.clone());
+                }
+                AppLinks::emit_status(&dest_owned, APP_LINK_ESTABLISHING, Some(handle.clone()));
+
+                {
+                    let dest_cb = dest_owned.clone();
+                    let iface_cb = iface.clone();
+                    let spec_cb = spec_for_open.clone();
+                    handle.set_link_established_callback(Some(Arc::new(move |established_handle: LinkHandle| {
+                        let still_tracked = REGISTRY
+                            .lock()
+                            .map(|reg| {
+                                reg.links
+                                    .get(&dest_cb)
+                                    .map(|tracked| tracked.same_link(&established_handle))
+                                    .unwrap_or(false)
+                            })
+                            .unwrap_or(false);
+                        if !still_tracked {
+                            return;
+                        }
+
+                        if let Ok(mut reg) = REGISTRY.lock() {
+                            reg.links.insert(dest_cb.clone(), established_handle.clone());
+                            reg.ready.insert(dest_cb.clone(), Instant::now());
+                        }
+
+                        {
+                            let dest_closed = dest_cb.clone();
+                            established_handle.set_link_closed_callback(Some(Arc::new(
+                                move |closing: LinkHandle| {
+                                    AppLinks::handle_tracked_outbound_closed(dest_closed.clone(), closing);
+                                },
+                            )));
+                        }
+
+                        spec_cb.ever_established.store(true, Ordering::Relaxed);
+                        spec_cb.reconnect_armed.store(true, Ordering::Release);
+                        spec_cb.attempt_in_flight.store(false, Ordering::Release);
+                        log(
+                            &format!(
+                                "[APP_LINK] persistent outbound ACTIVE via {} for {}",
+                                iface_cb,
+                                hexrep(&dest_cb, false)
+                            ),
+                            LOG_NOTICE,
+                            false,
+                            false,
+                        );
+                        AppLinks::emit_status(&dest_cb, APP_LINK_ACTIVE, Some(established_handle));
+                    })));
+                }
+                {
+                    let dest_cb = dest_owned.clone();
+                    let spec_cb = spec_for_open.clone();
+                    handle.set_link_closed_callback(Some(Arc::new(move |closing: LinkHandle| {
+                        let was_tracked = AppLinks::remove_tracked_outbound_if_same(&dest_cb, &closing);
+                        spec_cb.attempt_in_flight.store(false, Ordering::Release);
+                        if was_tracked {
+                            log(
+                                &format!(
+                                    "[APP_LINK] persistent open: link closed before active for {}",
+                                    hexrep(&dest_cb, false)
+                                ),
+                                LOG_NOTICE,
+                                false,
+                                false,
+                            );
+                            AppLinks::emit_status(&dest_cb, APP_LINK_DISCONNECTED, None);
+                        }
+                    })));
+                }
+
+                Transport::synthesize_tunnel_all_tcp();
+
+                if let Err(e) = handle.initiate() {
+                    AppLinks::remove_tracked_outbound_if_same(&dest_owned, &handle);
+                    spec_for_open
+                        .attempt_in_flight
+                        .store(false, Ordering::Release);
+                    log(
+                        &format!(
+                            "[APP_LINK] persistent open: initiate failed for {}: {:?}",
+                            hexrep(&dest_owned, false),
+                            e
+                        ),
+                        LOG_NOTICE,
+                        false,
+                        false,
+                    );
+                    AppLinks::emit_status(&dest_owned, APP_LINK_DISCONNECTED, None);
+                    return;
+                }
+            })
+            .expect("failed to spawn app_links persistent open thread");
     }
 
     // ─── Three-tier send ──────────────────────────────────────────────
@@ -1058,24 +1526,8 @@ impl AppLinks {
         // until the next send's expire_path clears them.
         {
             let dest_cb = dest.to_vec();
-            let cbs: Vec<AppLinkStatusCallback> = REGISTRY
-                .lock()
-                .map(|r| r.status_callbacks.clone())
-                .unwrap_or_default();
-            established_handle.set_link_closed_callback(Some(Arc::new(move |_: LinkHandle| {
-                {
-                    let mut reg = REGISTRY.lock().expect("app_links registry mutex poisoned");
-                    reg.ready.remove(&dest_cb);
-                    reg.links.remove(&dest_cb);
-                }
-                AppLinks::invalidate_liveness(&dest_cb);
-                log(
-                    &format!("[APP_LINK] tier-3 link closed for {} → DISCONNECTED", hexrep(&dest_cb, false)),
-                    LOG_NOTICE, false, false,
-                );
-                for cb in &cbs {
-                    cb(&dest_cb, APP_LINK_DISCONNECTED, None);
-                }
+            established_handle.set_link_closed_callback(Some(Arc::new(move |closing: LinkHandle| {
+                AppLinks::handle_tracked_outbound_closed(dest_cb.clone(), closing);
             })));
         }
 
@@ -1528,36 +1980,79 @@ mod tests {
     }
 
     #[test]
-    fn propagation_open_is_path_race_only() {
+    fn app_link_spec_preserves_requested_mode() {
+        let spec = AppLinkSpec::with_mode(
+            "rfed",
+            vec!["channel".to_string()],
+            LinkMode::Persistent,
+        );
+        assert_eq!(spec.mode, LinkMode::Persistent);
+    }
+
+    #[test]
+    fn persistent_mode_is_explicitly_wired() {
         let src = include_str!("lib.rs");
         let production = src
             .split("#[cfg(test)]")
             .next()
             .expect("production source prefix must exist");
         assert!(
-            !production.contains("race_path_verified_this_session(&dest_owned, LIVENESS_BUDGET)"),
-            "AppLinks must not special-case propagation destinations"
+            production.contains("Self::open_with_mode(dest_hash, app_name, aspects, LinkMode::Persistent);"),
+            "open_persistent must register the persistent lifecycle mode"
         );
         assert!(
-            !production.contains("start_persistent_link"),
-            "AppLinks must not build persistent infrastructure links"
+            production.contains("fn establish_persistent(dest_hash: &[u8], spec: AppLinkSpec)"),
+            "persistent mode must have a dedicated establish path"
+        );
+        assert!(
+            !production.contains("app_links_reestablish"),
+            "persistent mode must remain event-driven; timed retry loops must not return"
         );
     }
 
     #[test]
-    fn app_links_has_no_persistent_link_close_loop() {
+    fn persistent_close_reopen_is_single_shot() {
         let src = include_str!("lib.rs");
         let production = src
             .split("#[cfg(test)]")
             .next()
             .expect("production source prefix must exist");
         assert!(
-            !production.contains("PersistentLink"),
-            "AppLinks must not own persistent infrastructure-link close handling"
+            production.contains("Self::request_reopen_internal(&dest_hash, false);"),
+            "persistent close-triggered reopen must NOT re-arm itself"
         );
         assert!(
-            !production.contains("app_links_reestablish"),
-            "removed retry thread name must not return"
+            production.contains("Self::request_reopen_internal(dest_hash, true);"),
+            "external reopen requests must re-arm persistent links for one future close"
+        );
+    }
+
+    #[test]
+    fn persistent_establish_is_not_bounded_by_liveness_budget() {
+        let src = include_str!("lib.rs");
+        let production = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source prefix must exist");
+        let start = production
+            .find("fn establish_persistent(dest_hash: &[u8], spec: AppLinkSpec)")
+            .expect("persistent establish path must exist");
+        let tail = &production[start..];
+        let end = tail
+            .find("// ─── Three-tier send")
+            .expect("persistent establish fragment must end before send tiers");
+        let fragment = &tail[..end];
+        assert!(
+            !fragment.contains("recv_timeout(LIVENESS_BUDGET)"),
+            "persistent open must not abandon link establishment on the 5-second liveness budget"
+        );
+        assert!(
+            fragment.contains("set_link_established_callback(Some"),
+            "persistent open must remain callback-driven for activation"
+        );
+        assert!(
+            fragment.contains("persistent open: link closed before active"),
+            "persistent open must still surface deterministic close-before-active failures"
         );
     }
 }
