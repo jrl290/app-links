@@ -269,6 +269,13 @@ impl AppLinks {
             && spec.aspects[0] == "propagation"
     }
 
+    fn ephemeral_requires_verified_session_path(spec: &AppLinkSpec) -> bool {
+        spec.mode == LinkMode::EphemeralLink
+            && spec.app_name == "lxmf"
+            && spec.aspects.len() == 1
+            && spec.aspects[0] == "delivery"
+    }
+
     fn outbound_link_live(dest_hash: &[u8]) -> bool {
         Self::get_handle(dest_hash)
             .map(|handle| {
@@ -891,12 +898,18 @@ impl AppLinks {
                 // both failed.  At that point we have direct evidence the cached path
                 // is not working and forcing a fresh lookup is warranted.
                 //
-                // Here in appLinkOpen we use has_path fast-path: if a valid path
-                // already exists (from disk or a recent announce), return it
-                // immediately.  If not, fire PATH_REQ on all interfaces and wait for
-                // the best response, subject to LIVENESS_BUDGET.  The quality gate in
-                // the announce handler then guards against worse inbound paths.
-                let result = liveness::race_path(&dest_owned, LIVENESS_BUDGET);
+                // For ephemeral lxmf.delivery destinations, READY must mean the path
+                // has been confirmed in this process. Disk-restored routes are not
+                // sufficient for direct-send readiness because the first actual LRREQ
+                // would otherwise discover staleness only after the user hits Send.
+                let result = match if Self::ephemeral_requires_verified_session_path(&spec) {
+                    liveness::race_path_verified_this_session(&dest_owned, LIVENESS_BUDGET)
+                } else {
+                    liveness::race_path(&dest_owned, LIVENESS_BUDGET)
+                } {
+                    Ok(iface) => Ok(iface),
+                    Err(e) => Err(e),
+                };
 
                 let cbs: Vec<AppLinkStatusCallback> = REGISTRY
                     .lock()
@@ -1268,8 +1281,11 @@ impl AppLinks {
         Self::send(dest, packed, on_delivered, on_propagation_needed, on_failed);
     }
 
-    /// Drive the tier chain synchronously.  Runs on the background thread
-    /// spawned by [`AppLinks::send`].
+    /// Drive the tier chain on the background send thread.
+    ///
+    /// Timer P runs in parallel on its own thread. Tier advancement waits only
+    /// when an earlier tier actually queued a packet, so empty tiers never burn
+    /// direct-send budget before the first real LRREQ.
     fn run_tier_chain(
         dest: &[u8],
         packed: Vec<u8>,
@@ -1292,20 +1308,15 @@ impl AppLinks {
         {
             let delivered_p = delivered.clone();
             let on_prop = on_propagation_needed;
-            std::thread::Builder::new()
-                .name("app_links_prop_timer".into())
-                .spawn(move || {
-                    std::thread::sleep(PROP_FALLBACK_DELAY);
-                    if !delivered_p.load(Ordering::Acquire) {
-                        on_prop();
-                    }
-                })
-                .expect("failed to spawn propagation fallback timer");
+            Self::spawn_after("app_links_prop_timer", PROP_FALLBACK_DELAY, move || {
+                if !delivered_p.load(Ordering::Acquire) {
+                    on_prop();
+                }
+            });
         }
 
         // ── Tier 1: inbound link ──────────────────────────────────────
-        // Timer A (1 s before tier 2) is owned by tier 2, not tier 1.
-        // Tier 1 fires and immediately falls through; it does not wait.
+        // Fires immediately when a peer-initiated inbound link already exists.
         let inbound = Self::get_inbound_handle(dest)
             .filter(|h| h.status() == STATE_ACTIVE);
 
@@ -1319,28 +1330,26 @@ impl AppLinks {
                 &packed,
                 delivered.clone(),
                 on_delivered.clone(),
-            );
-            true
+            )
         } else {
             false
         };
 
-        // ── Tier 2: cached outbound link ─────────────────────────────
-        // Timer A: wait 1 s before firing, but ONLY if tier 1 actually sent a
-        // packet that needs time to prove delivery.  If tier 1 had no link,
-        // there is nothing to wait for and we proceed immediately.
-        // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+        // Timer A: only wait when tier 1 actually put a packet in flight.
         if tier1_fired {
-            std::thread::sleep(Duration::from_secs(1));
+            std::thread::sleep(Duration::from_secs_f64(DIRECT_STAGGER_WAIT));
             if delivered.load(Ordering::Acquire) {
                 log(
                     &format!("[APP_LINK] send delivered via tier-1 for {}", hexrep(dest, false)),
-                    LOG_NOTICE, false, false,
+                    LOG_NOTICE,
+                    false,
+                    false,
                 );
                 return;
             }
         }
 
+        // ── Tier 2: cached outbound link ─────────────────────────────
         let outbound = REGISTRY
             .lock()
             .ok()
@@ -1350,46 +1359,87 @@ impl AppLinks {
         let tier2_fired = if let Some(handle) = outbound {
             log(
                 &format!("[APP_LINK] send tier-2 (cached outbound link) for {}", hexrep(dest, false)),
-                LOG_NOTICE, false, false,
+                LOG_NOTICE,
+                false,
+                false,
             );
             Self::fire_on_link(
                 &handle,
                 &packed,
                 delivered.clone(),
                 on_delivered.clone(),
-            );
-            true
+            )
         } else {
             false
         };
 
-        // ── Tier 3: expire + race + new link + send ───────────────────
-        // Timer B: wait 1 s before firing, but ONLY if tier 2 actually sent a
-        // packet that needs time to prove delivery.  If tier 2 had no link,
-        // there is nothing to wait for and we proceed immediately.
-        // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+        // Timer B: only wait when tier 2 actually put a packet in flight.
         if tier2_fired {
-            std::thread::sleep(Duration::from_secs(1));
+            std::thread::sleep(Duration::from_secs_f64(DIRECT_STAGGER_WAIT));
             if delivered.load(Ordering::Acquire) {
                 log(
                     &format!("[APP_LINK] send delivered via tier-2 for {}", hexrep(dest, false)),
-                    LOG_NOTICE, false, false,
+                    LOG_NOTICE,
+                    false,
+                    false,
                 );
                 return;
             }
         }
 
+        // ── Tier 3: path verification + new link + send ──────────────
+        if delivered.load(Ordering::Acquire) {
+            return;
+        }
+
+        Self::run_tier3(
+            dest,
+            &packed,
+            delivered,
+            on_delivered,
+            on_failed,
+        );
+    }
+
+    fn spawn_after<F>(name: &str, delay: Duration, job: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        std::thread::Builder::new()
+            .name(name.to_string())
+            .spawn(move || {
+                std::thread::sleep(delay);
+                job();
+            })
+            .expect("failed to spawn app-links send scheduler");
+    }
+
+    fn fire_failed_if_undelivered(
+        delivered: &Arc<AtomicBool>,
+        on_failed: &Arc<dyn Fn() + Send + Sync + 'static>,
+    ) {
+        if !delivered.load(Ordering::Acquire) {
+            on_failed();
+        }
+    }
+
+    fn run_tier3(
+        dest: &[u8],
+        packed: &[u8],
+        delivered: Arc<AtomicBool>,
+        on_delivered: Arc<dyn Fn() + Send + Sync + 'static>,
+        on_failed: Arc<dyn Fn() + Send + Sync + 'static>,
+    ) {
         log(
             &format!("[APP_LINK] send tier-3 (path race + new link) for {}", hexrep(dest, false)),
             LOG_NOTICE, false, false,
         );
 
-        // Expire any stale disk-cached path so the race resolves via the
-        // relay that *currently* has a route to the destination.
-        // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
-        Transport::expire_path(dest);
-
-        let iface = match liveness::race_path(dest, LIVENESS_BUDGET) {
+        let iface = match if Transport::has_path(dest) && Transport::is_path_verified_this_session(dest) {
+            liveness::race_path(dest, LIVENESS_BUDGET)
+        } else {
+            liveness::race_path_verified_this_session(dest, LIVENESS_BUDGET)
+        } {
             Ok(i) => i,
             Err(e) => {
                 log(
@@ -1402,7 +1452,7 @@ impl AppLinks {
                     false,
                     false,
                 );
-                on_failed();
+                Self::fire_failed_if_undelivered(&delivered, &on_failed);
                 return;
             }
         };
@@ -1425,7 +1475,7 @@ impl AppLinks {
                     false,
                     false,
                 );
-                on_failed();
+                Self::fire_failed_if_undelivered(&delivered, &on_failed);
                 return;
             }
         };
@@ -1453,7 +1503,7 @@ impl AppLinks {
                     false,
                     false,
                 );
-                on_failed();
+                Self::fire_failed_if_undelivered(&delivered, &on_failed);
                 return;
             }
         };
@@ -1471,7 +1521,7 @@ impl AppLinks {
                     false,
                     false,
                 );
-                on_failed();
+                Self::fire_failed_if_undelivered(&delivered, &on_failed);
                 return;
             }
         };
@@ -1509,7 +1559,7 @@ impl AppLinks {
                 false,
                 false,
             );
-            on_failed();
+            Self::fire_failed_if_undelivered(&delivered, &on_failed);
             return;
         }
 
@@ -1525,7 +1575,7 @@ impl AppLinks {
                     false,
                     false,
                 );
-                on_failed();
+                Self::fire_failed_if_undelivered(&delivered, &on_failed);
                 return;
             }
             Err(_) => {
@@ -1538,7 +1588,7 @@ impl AppLinks {
                     false,
                     false,
                 );
-                on_failed();
+                Self::fire_failed_if_undelivered(&delivered, &on_failed);
                 return;
             }
         };
@@ -1564,6 +1614,10 @@ impl AppLinks {
             })));
         }
 
+        if delivered.load(Ordering::Acquire) {
+            return;
+        }
+
         // Fire and wait for LRPROOF.
         // Interruptible proof wait: the delivery callback sends on proof_tx so
         // this thread wakes immediately when the proof arrives rather than
@@ -1583,7 +1637,7 @@ impl AppLinks {
             proof_cb,
         );
         if !fired {
-            on_failed();
+            Self::fire_failed_if_undelivered(&delivered, &on_failed);
             return;
         }
 
@@ -1612,7 +1666,7 @@ impl AppLinks {
                     false,
                     false,
                 );
-                on_failed();
+                Self::fire_failed_if_undelivered(&delivered, &on_failed);
             }
         }
     }
@@ -2086,6 +2140,63 @@ mod tests {
         assert!(
             fragment.contains("persistent open: link closed before active"),
             "persistent open must still surface deterministic close-before-active failures"
+        );
+    }
+
+    #[test]
+    fn direct_send_uses_fixed_stagger_scheduler() {
+        let src = include_str!("lib.rs");
+        let production = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source prefix must exist");
+        let start = production
+            .find("fn run_tier_chain(")
+            .expect("run_tier_chain must exist");
+        let tail = &production[start..];
+        let end = tail
+            .find("fn run_tier3(")
+            .expect("run_tier3 must exist after run_tier_chain");
+        let fragment = &tail[..end];
+        assert!(
+            fragment.contains("if tier1_fired {")
+                && fragment.contains("Duration::from_secs_f64(DIRECT_STAGGER_WAIT)"),
+            "tier-2 must wait only when tier-1 actually queued a packet"
+        );
+        assert!(
+            fragment.contains("if tier2_fired {")
+                && fragment.contains("Duration::from_secs_f64(DIRECT_STAGGER_WAIT)"),
+            "tier-3 must wait only when tier-2 actually queued a packet"
+        );
+        assert!(
+            !fragment.contains("Duration::from_secs_f64(DIRECT_STAGGER_WAIT * 2.0)"),
+            "tier-3 must not burn a fixed extra second when tier-2 never fired"
+        );
+        assert!(
+            !fragment.contains("spawn_after(\n                \"app_links_tier2\""),
+            "tier scheduling must not rely on detached fixed-delay worker threads"
+        );
+    }
+
+    #[test]
+    fn ephemeral_delivery_open_requires_verified_session_path() {
+        let src = include_str!("lib.rs");
+        let production = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source prefix must exist");
+        let start = production
+            .find("fn establish(dest_hash: &[u8])")
+            .expect("ephemeral establish path must exist");
+        let tail = &production[start..];
+        let end = tail
+            .find("fn establish_persistent(")
+            .expect("ephemeral establish fragment must end before persistent path");
+        let fragment = &tail[..end];
+        assert!(
+            fragment.contains("Self::ephemeral_requires_verified_session_path(&spec)")
+                && fragment.contains("liveness::race_path_verified_this_session(&dest_owned, LIVENESS_BUDGET)"),
+            "ephemeral lxmf.delivery opens must require a path verified in this process"
         );
     }
 }
