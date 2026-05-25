@@ -58,7 +58,11 @@
 //!
 //! `AppLinks::send(dest, packed, on_delivered, on_propagation_needed, on_failed)` drives:
 //!
-//! Timer P (5 s) starts in parallel the moment `send` is called.  If the
+//! Timer P starts in parallel the moment `send` is called.  Normally it uses
+//! the 5 s liveness budget, but when the current APP_LINK status is already
+//! `DISCONNECTED` it fires immediately so propagation can start in parallel
+//! with the fresh direct cascade.
+//! If the
 //! message is not delivered by then, `on_propagation_needed` fires once.
 //! This is independent of the tier chain.
 //!
@@ -85,13 +89,14 @@
 //! establishes and holds an outbound `LinkHandle` in `Registry.links`.
 //! The underlying `Link` actor owns keepalive and stale detection.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use once_cell::sync::Lazy;
 
+use reticulum_rust::announce_log;
 use reticulum_rust::destination::{Destination, DestinationType};
 use reticulum_rust::identity::Identity;
 use reticulum_rust::link::{
@@ -158,6 +163,22 @@ impl Default for LinkPolicy {
 /// an established handle). For ephemeral-link open/status transitions it will be
 /// `None`.
 pub type AppLinkStatusCallback = Arc<dyn Fn(&[u8], u8, Option<LinkHandle>) + Send + Sync>;
+
+/// Source of inbound DATA delivered to a named app destination.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InboundPacketSource {
+    Transport,
+    Link,
+}
+
+/// Shared callback used by generic app destinations that accept both plain
+/// destination DATA and DATA arriving over an established link.
+pub type InboundPacketCallback =
+    Arc<dyn Fn(Vec<u8>, InboundPacketSource) + Send + Sync + 'static>;
+
+/// Optional hook fired when a peer establishes a link to a destination that
+/// has been wired via [`AppLinks::wire_inbound_destination`].
+pub type InboundLinkEstablishedCallback = Arc<dyn Fn() + Send + Sync + 'static>;
 
 /// Per-destination lifecycle mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -228,6 +249,10 @@ struct Registry {
     /// [`AppLinks::register_inbound`] when a peer opens a link to us and
     /// identifies themselves.  Auto-removed by closed callback.
     inbound_links: HashMap<Vec<u8>, LinkHandle>,
+    /// Destinations whose last direct send exhausted the normal 5 s Timer P
+    /// budget and escalated to propagation. These stay logically red until a
+    /// fresh path or link establishment succeeds.
+    prop_fallback_disconnected: HashSet<Vec<u8>>,
     status_callbacks: Vec<AppLinkStatusCallback>,
     announce_handler_installed: bool,
     policy: LinkPolicy,
@@ -240,6 +265,7 @@ impl Registry {
             ready: HashMap::new(),
             links: HashMap::new(),
             inbound_links: HashMap::new(),
+            prop_fallback_disconnected: HashSet::new(),
             status_callbacks: Vec::new(),
             announce_handler_installed: false,
             policy: LinkPolicy::Foreground,
@@ -263,6 +289,32 @@ impl AppLinks {
         }
     }
 
+    fn mark_prop_fallback_disconnected(dest_hash: &[u8]) {
+        let changed = REGISTRY
+            .lock()
+            .map(|mut reg| reg.prop_fallback_disconnected.insert(dest_hash.to_vec()))
+            .unwrap_or(false);
+        if !changed {
+            return;
+        }
+        log(
+            &format!(
+                "[APP_LINK] Timer P latched DISCONNECTED for {}",
+                hexrep(dest_hash, false)
+            ),
+            LOG_NOTICE,
+            false,
+            false,
+        );
+        Self::emit_status(dest_hash, APP_LINK_DISCONNECTED, None);
+    }
+
+    fn clear_prop_fallback_disconnected(dest_hash: &[u8]) {
+        if let Ok(mut reg) = REGISTRY.lock() {
+            reg.prop_fallback_disconnected.remove(dest_hash);
+        }
+    }
+
     fn persistent_requires_verified_session_path(spec: &AppLinkSpec) -> bool {
         spec.app_name == "lxmf"
             && spec.aspects.len() == 1
@@ -271,9 +323,6 @@ impl AppLinks {
 
     fn ephemeral_requires_verified_session_path(spec: &AppLinkSpec) -> bool {
         spec.mode == LinkMode::EphemeralLink
-            && spec.app_name == "lxmf"
-            && spec.aspects.len() == 1
-            && spec.aspects[0] == "delivery"
     }
 
     fn outbound_link_live(dest_hash: &[u8]) -> bool {
@@ -375,6 +424,33 @@ impl AppLinks {
     pub fn register_status_callback(callback: AppLinkStatusCallback) {
         let mut reg = REGISTRY.lock().expect("app_links registry mutex poisoned");
         reg.status_callbacks.push(callback);
+    }
+
+    /// Wire a generic inbound app destination so the caller handles one
+    /// packet callback regardless of whether DATA arrived directly on the
+    /// destination or over a peer-established link.
+    pub fn wire_inbound_destination(
+        destination: &mut Destination,
+        on_packet: InboundPacketCallback,
+        on_link_established: Option<InboundLinkEstablishedCallback>,
+    ) {
+        let direct_packet_cb = on_packet.clone();
+        destination.set_packet_callback(Some(Arc::new(move |data: &[u8], _pkt| {
+            direct_packet_cb(data.to_vec(), InboundPacketSource::Transport);
+        })));
+
+        let link_packet_cb = on_packet;
+        let link_established_cb = on_link_established;
+        destination.set_link_established_callback(Some(Arc::new(move |link: LinkHandle| {
+            if let Some(callback) = &link_established_cb {
+                callback();
+            }
+
+            let per_link_packet_cb = link_packet_cb.clone();
+            link.set_packet_callback(Some(Arc::new(move |data: &[u8], _pkt| {
+                per_link_packet_cb(data.to_vec(), InboundPacketSource::Link);
+            })));
+        })));
     }
 
     /// Current host lifecycle policy.  Defaults to [`LinkPolicy::Foreground`].
@@ -579,6 +655,7 @@ impl AppLinks {
             reg.ready.remove(dest_hash);
             let dl = reg.links.remove(dest_hash);
             let di = reg.inbound_links.remove(dest_hash);
+            reg.prop_fallback_disconnected.remove(dest_hash);
             (removed, dl, di)
         };
         if let Some(handle) = &dropped_link {
@@ -608,9 +685,12 @@ impl AppLinks {
     ///                                 (propagation destinations only).
     ///   * `APP_LINK_ACTIVE`         — path known (ready) and still valid,
     ///                                 OR a held link is `STATE_ACTIVE`.
-    ///   * `APP_LINK_DISCONNECTED`   — registered, no path, no race.
+    ///   * `APP_LINK_DISCONNECTED`   — registered, no path, no race, OR
+    ///                                 the last direct send had to escalate to
+    ///                                 propagation and no fresh path/link
+    ///                                 success has cleared that red latch yet.
     pub fn status(dest_hash: &[u8]) -> u8 {
-        let (registered, in_flight, link, inbound, in_ready) = {
+        let (registered, in_flight, link, inbound, in_ready, prop_fallback_disconnected) = {
             let reg = match REGISTRY.lock() {
                 Ok(g) => g,
                 Err(_) => return APP_LINK_NONE,
@@ -623,10 +703,21 @@ impl AppLinks {
             let link = reg.links.get(dest_hash).cloned();
             let inbound = reg.inbound_links.get(dest_hash).cloned();
             let in_ready = reg.ready.contains_key(dest_hash);
-            (registered, in_flight, link, inbound, in_ready)
+            let prop_fallback_disconnected = reg.prop_fallback_disconnected.contains(dest_hash);
+            (
+                registered,
+                in_flight,
+                link,
+                inbound,
+                in_ready,
+                prop_fallback_disconnected,
+            )
         };
         if !registered {
             return APP_LINK_NONE;
+        }
+        if prop_fallback_disconnected {
+            return APP_LINK_DISCONNECTED;
         }
         // Held link (propagation node, or recent tier-3 cached link).
         if let Some(handle) = link {
@@ -644,8 +735,11 @@ impl AppLinks {
             return APP_LINK_PATH_REQUESTED;
         }
         // EphemeralLink: ACTIVE when ready entry exists and path is still valid.
-        if in_ready && Transport::has_path(dest_hash) {
-            return APP_LINK_ACTIVE;
+        if in_ready {
+            let candidates = liveness_candidate_interfaces();
+            if cached_path_iface_is_live(dest_hash, &candidates, false).is_some() {
+                return APP_LINK_ACTIVE;
+            }
         }
         APP_LINK_DISCONNECTED
     }
@@ -693,6 +787,7 @@ impl AppLinks {
             false,
             false,
         );
+        Self::clear_prop_fallback_disconnected(dest_hash);
         if let Ok(mut reg) = REGISTRY.lock() {
             reg.inbound_links.insert(dest_hash.to_vec(), link);
         }
@@ -898,10 +993,10 @@ impl AppLinks {
                 // both failed.  At that point we have direct evidence the cached path
                 // is not working and forcing a fresh lookup is warranted.
                 //
-                // For ephemeral lxmf.delivery destinations, READY must mean the path
-                // has been confirmed in this process. Disk-restored routes are not
-                // sufficient for direct-send readiness because the first actual LRREQ
-                // would otherwise discover staleness only after the user hits Send.
+                // For ephemeral destinations, READY must mean the path has been
+                // confirmed in this process. Disk-restored routes are not
+                // sufficient because the first actual LRREQ would otherwise
+                // discover staleness only after the user hits Send.
                 let result = match if Self::ephemeral_requires_verified_session_path(&spec) {
                     liveness::race_path_verified_this_session(&dest_owned, LIVENESS_BUDGET)
                 } else {
@@ -922,6 +1017,7 @@ impl AppLinks {
                             let mut reg = REGISTRY
                                 .lock()
                                 .expect("app_links registry mutex poisoned");
+                            reg.prop_fallback_disconnected.remove(&dest_owned);
                             reg.ready.insert(dest_owned.clone(), Instant::now());
                         }
                         ever_established.store(true, Ordering::Relaxed);
@@ -1033,6 +1129,7 @@ impl AppLinks {
                 if let Ok(mut cache) = LIVENESS_CACHE.lock() {
                     cache.insert(dest_owned.clone(), (iface.clone(), Instant::now()));
                 }
+                AppLinks::clear_prop_fallback_disconnected(&dest_owned);
 
                 let identity = match Identity::recall(&dest_owned) {
                     Some(id) => id,
@@ -1295,21 +1392,28 @@ impl AppLinks {
     ) {
         // Shared delivered gate.  The first delivery proof from any tier wins.
         let delivered = Arc::new(AtomicBool::new(false));
+        let prop_delay = Self::prop_fallback_delay_for_status(Self::status(dest));
 
         // ── Timer P: propagation fallback ─────────────────────────────
         //
-        // Fires on_propagation_needed after PROP_FALLBACK_DELAY if the message
-        // has not been delivered by then.  Runs on a separate thread so it is
-        // truly parallel with all tiers.
+        // Fires on_propagation_needed after the computed propagation delay if
+        // the message has not been delivered by then. DISCONNECTED readiness
+        // means the UI is already red, so the delay is collapsed to zero while
+        // the direct cascade still continues in parallel. Runs on a separate
+        // thread so it is truly parallel with all tiers.
         //
         // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
-        // This is the authoritative source of the 5-second propagation trigger.
+        // This is the authoritative source of the propagation trigger delay.
         // The caller (lxm_router) handles the actual propagation mechanics.
         {
             let delivered_p = delivered.clone();
+            let dest_p = dest.to_vec();
             let on_prop = on_propagation_needed;
-            Self::spawn_after("app_links_prop_timer", PROP_FALLBACK_DELAY, move || {
+            Self::spawn_after("app_links_prop_timer", prop_delay, move || {
                 if !delivered_p.load(Ordering::Acquire) {
+                    if prop_delay > Duration::ZERO {
+                        AppLinks::mark_prop_fallback_disconnected(&dest_p);
+                    }
                     on_prop();
                 }
             });
@@ -1412,6 +1516,14 @@ impl AppLinks {
                 job();
             })
             .expect("failed to spawn app-links send scheduler");
+    }
+
+    fn prop_fallback_delay_for_status(status: u8) -> Duration {
+        if status == APP_LINK_DISCONNECTED {
+            Duration::ZERO
+        } else {
+            PROP_FALLBACK_DELAY
+        }
     }
 
     fn fire_failed_if_undelivered(
@@ -1599,6 +1711,7 @@ impl AppLinks {
         }
         // Also mark as ready so status() returns ACTIVE.
         if let Ok(mut reg) = REGISTRY.lock() {
+            reg.prop_fallback_disconnected.remove(dest);
             reg.ready.insert(dest.to_vec(), Instant::now());
         }
 
@@ -1769,10 +1882,62 @@ impl std::fmt::Display for SendErr {
 
 impl std::error::Error for SendErr {}
 
+fn liveness_candidate_interfaces() -> Vec<String> {
+    reticulum_rust::transport::get_state_snapshot()
+        .interfaces
+        .iter()
+    .filter(|i| i.out && i.online && i.bitrate.map_or(true, |b| b >= LORA_BITRATE_THRESHOLD))
+        .map(|i| i.name.clone())
+        .collect()
+}
+
+fn path_iface_matches_candidates(path_iface: Option<&str>, candidates: &[String]) -> bool {
+    path_iface
+        .map(|iface| candidates.iter().any(|candidate| candidate == iface))
+        .unwrap_or(false)
+}
+
+fn cached_path_iface_is_live(
+    dest_hash: &[u8],
+    candidates: &[String],
+    require_verified_session: bool,
+) -> Option<String> {
+    if !Transport::has_path(dest_hash) {
+        return None;
+    }
+    if require_verified_session && !Transport::is_path_verified_this_session(dest_hash) {
+        return None;
+    }
+    let iface = Transport::next_hop_interface(dest_hash)?;
+    if path_iface_matches_candidates(Some(&iface), candidates) {
+        Some(iface)
+    } else {
+        None
+    }
+}
+
+struct PathRaceLogWatch {
+    dest_hash: Vec<u8>,
+}
+
+impl PathRaceLogWatch {
+    fn new(dest_hash: &[u8]) -> Self {
+        announce_log::watch_destination(dest_hash);
+        Self {
+            dest_hash: dest_hash.to_vec(),
+        }
+    }
+}
+
+impl Drop for PathRaceLogWatch {
+    fn drop(&mut self) {
+        announce_log::unwatch_destination(&self.dest_hash);
+    }
+}
+
 /// Liveness race module.
 pub mod liveness {
     use super::*;
-    use reticulum_rust::transport::get_state_snapshot;
 
     /// Race a path-request on every online, non-LoRa interface and return
     /// the name of the iface whose response landed first.
@@ -1788,31 +1953,25 @@ pub mod liveness {
     ///   * Returns `Transport::next_hop_interface` on first hit, or
     ///     `Err(SendErr::LivenessTimeout)` after `budget`.
     ///
-    /// Does NOT consult the liveness cache — callers check the cache first.
+    /// Does NOT consult cached path-table entries at all. Any pre-existing
+    /// cache row for `dest_hash` is unconditionally expired before the race
+    /// begins, so success requires a fresh PATH_RESPONSE / announce observed
+    /// within `budget`.
     pub fn race_path(
         dest_hash: &[u8],
         budget: Duration,
     ) -> Result<String, SendErr> {
-        let snap = get_state_snapshot();
-        let candidates: Vec<String> = snap
-            .interfaces
-            .iter()
-            .filter(|i| {
-                i.online && i.bitrate.map_or(true, |b| b >= LORA_BITRATE_THRESHOLD)
-            })
-            .map(|i| i.name.clone())
-            .collect();
+        let _watch = PathRaceLogWatch::new(dest_hash);
+        let candidates = liveness_candidate_interfaces();
 
         if candidates.is_empty() {
             return Err(SendErr::NoUsableInterface);
         }
 
-        // Fast path: path already exists.
-        if Transport::has_path(dest_hash) {
-            if let Some(iface) = Transport::next_hop_interface(dest_hash) {
-                return Ok(iface);
-            }
-        }
+        // Drop any cached path before racing. Path Race must never benefit
+        // from a stale path-table row: success has to come from a fresh
+        // PATH_RESPONSE / announce arriving inside `budget`.
+        Transport::expire_path(dest_hash);
 
         // Fire request_path on every candidate iface in parallel.
         for iface in &candidates {
@@ -1826,7 +1985,7 @@ pub mod liveness {
         // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §4: this is the
         // event-driven replacement for the previous sleep-poll loop.
         if Transport::wait_for_path(dest_hash, budget) {
-            if let Some(iface) = Transport::next_hop_interface(dest_hash) {
+            if let Some(iface) = cached_path_iface_is_live(dest_hash, &candidates, false) {
                 return Ok(iface);
             }
         }
@@ -1835,8 +1994,10 @@ pub mod liveness {
     }
 
     /// Same as [`race_path`], but success requires a path verified by an
-    /// inbound PATH_RESPONSE / announce in this process. Cached path-table
-    /// entries from disk do not satisfy the readiness gate.
+    /// inbound PATH_RESPONSE / announce in this process. Any cached path-
+    /// table entry for `dest_hash` is unconditionally expired before the
+    /// race begins, so the readiness gate can only be satisfied by a fresh
+    /// in-session event.
     ///
     /// Used by persistent propagation links so LRREQ is sent only after the
     /// relay has proven it can reply on the current session.
@@ -1844,32 +2005,22 @@ pub mod liveness {
         dest_hash: &[u8],
         budget: Duration,
     ) -> Result<String, SendErr> {
-        let snap = get_state_snapshot();
-        let candidates: Vec<String> = snap
-            .interfaces
-            .iter()
-            .filter(|i| {
-                i.online && i.bitrate.map_or(true, |b| b >= LORA_BITRATE_THRESHOLD)
-            })
-            .map(|i| i.name.clone())
-            .collect();
+        let _watch = PathRaceLogWatch::new(dest_hash);
+        let candidates = liveness_candidate_interfaces();
 
         if candidates.is_empty() {
             return Err(SendErr::NoUsableInterface);
         }
 
-        if Transport::has_path(dest_hash) && Transport::is_path_verified_this_session(dest_hash) {
-            if let Some(iface) = Transport::next_hop_interface(dest_hash) {
-                return Ok(iface);
-            }
-        }
+        // Drop any cached path before racing — see `race_path` for rationale.
+        Transport::expire_path(dest_hash);
 
         for iface in &candidates {
             Transport::request_path(dest_hash, None, Some(iface.clone()), None, None);
         }
 
         if Transport::wait_for_path_verified_this_session(dest_hash, budget) {
-            if let Some(iface) = Transport::next_hop_interface(dest_hash) {
+            if let Some(iface) = cached_path_iface_is_live(dest_hash, &candidates, true) {
                 return Ok(iface);
             }
         }
@@ -1906,6 +2057,21 @@ impl AppLinks {
 mod tests {
     use super::*;
     use std::sync::mpsc;
+
+    static REGISTRY_TEST_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+    fn reset_registry_for_test() {
+        if let Ok(mut reg) = REGISTRY.lock() {
+            reg.specs.clear();
+            reg.ready.clear();
+            reg.links.clear();
+            reg.inbound_links.clear();
+            reg.prop_fallback_disconnected.clear();
+        }
+        if let Ok(mut cache) = LIVENESS_CACHE.lock() {
+            cache.clear();
+        }
+    }
 
     /// Spawn a Timer P with a custom delay for test speed.
     fn spawn_prop_timer(
@@ -1970,6 +2136,78 @@ mod tests {
             rx.recv_timeout(Duration::from_millis(200)).is_err(),
             "Timer P must not fire when delivery beat it to the punch"
         );
+    }
+
+    #[test]
+    fn disconnected_status_uses_immediate_prop_delay() {
+        assert_eq!(
+            AppLinks::prop_fallback_delay_for_status(APP_LINK_DISCONNECTED),
+            Duration::ZERO,
+            "DISCONNECTED readiness must trigger immediate propagation fallback"
+        );
+    }
+
+    #[test]
+    fn non_disconnected_status_uses_default_prop_delay() {
+        for status in [
+            APP_LINK_NONE,
+            APP_LINK_PATH_REQUESTED,
+            APP_LINK_ESTABLISHING,
+            APP_LINK_ACTIVE,
+        ] {
+            assert_eq!(
+                AppLinks::prop_fallback_delay_for_status(status),
+                PROP_FALLBACK_DELAY,
+                "Only DISCONNECTED readiness may collapse Timer P to zero"
+            );
+        }
+    }
+
+    #[test]
+    fn prop_fallback_disconnect_latch_overrides_inflight_status() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        reset_registry_for_test();
+
+        let dest = b"peer-a".to_vec();
+        let spec = AppLinkSpec::new("lxmf", vec!["delivery".to_string()]);
+        spec.attempt_in_flight.store(true, Ordering::Release);
+        if let Ok(mut reg) = REGISTRY.lock() {
+            reg.specs.insert(dest.clone(), spec);
+        }
+
+        AppLinks::mark_prop_fallback_disconnected(&dest);
+
+        assert_eq!(
+            AppLinks::status(&dest),
+            APP_LINK_DISCONNECTED,
+            "Timer P red latch must override PATH_REQUESTED until a fresh success clears it"
+        );
+
+        reset_registry_for_test();
+    }
+
+    #[test]
+    fn clearing_prop_fallback_disconnect_restores_inflight_status() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        reset_registry_for_test();
+
+        let dest = b"peer-b".to_vec();
+        let spec = AppLinkSpec::new("lxmf", vec!["delivery".to_string()]);
+        spec.attempt_in_flight.store(true, Ordering::Release);
+        if let Ok(mut reg) = REGISTRY.lock() {
+            reg.specs.insert(dest.clone(), spec);
+            reg.prop_fallback_disconnected.insert(dest.clone());
+        }
+
+        AppLinks::clear_prop_fallback_disconnected(&dest);
+
+        assert_eq!(
+            AppLinks::status(&dest),
+            APP_LINK_PATH_REQUESTED,
+            "Fresh path resolution should be able to clear the red latch and expose live progress again"
+        );
+
+        reset_registry_for_test();
     }
 
     // §O3 — Delivered gate fires exactly once under concurrent tier delivery.
@@ -2179,7 +2417,7 @@ mod tests {
     }
 
     #[test]
-    fn ephemeral_delivery_open_requires_verified_session_path() {
+    fn ephemeral_open_requires_verified_session_path() {
         let src = include_str!("lib.rs");
         let production = src
             .split("#[cfg(test)]")
@@ -2196,7 +2434,149 @@ mod tests {
         assert!(
             fragment.contains("Self::ephemeral_requires_verified_session_path(&spec)")
                 && fragment.contains("liveness::race_path_verified_this_session(&dest_owned, LIVENESS_BUDGET)"),
-            "ephemeral lxmf.delivery opens must require a path verified in this process"
+            "ephemeral app-link opens must require a path verified in this process"
+        );
+    }
+
+    #[test]
+    fn path_iface_must_match_live_candidates() {
+        let candidates = vec!["Beleth".to_string(), "RPi TCP Transport".to_string()];
+        assert!(path_iface_matches_candidates(Some("Beleth"), &candidates));
+        assert!(!path_iface_matches_candidates(Some("rmap"), &candidates));
+        assert!(!path_iface_matches_candidates(None, &candidates));
+    }
+
+    #[test]
+    fn liveness_candidates_require_outbound_interfaces() {
+        let src = include_str!("lib.rs");
+        let production = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source prefix must exist");
+        assert!(
+            production.contains(".filter(|i| i.out && i.online && i.bitrate.map_or(true, |b| b >= LORA_BITRATE_THRESHOLD))"),
+            "AppLinks liveness races must ignore non-outbound transport interfaces when classifying READY paths"
+        );
+    }
+
+    #[test]
+    fn liveness_drops_cached_paths_before_racing() {
+        let src = include_str!("lib.rs");
+        let production = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source prefix must exist");
+        assert!(
+            !production.contains("soft_expire_stale_cached_path"),
+            "path races must not retain the soft-expire-by-candidate helper; cached paths are dropped unconditionally"
+        );
+        let race_start = production
+            .find("pub fn race_path(")
+            .expect("race_path must exist");
+        let verified_start = production[race_start..]
+            .find("pub fn race_path_verified_this_session(")
+            .map(|idx| race_start + idx)
+            .expect("race_path_verified_this_session must exist");
+        let race_fragment = &production[race_start..verified_start];
+        let verified_end = production[verified_start..]
+            .find("}\n}\n\nimpl AppLinks")
+            .map(|idx| verified_start + idx)
+            .expect("verified race fragment must terminate before impl AppLinks");
+        let verified_fragment = &production[verified_start..verified_end];
+
+        let race_expire = race_fragment
+            .find("Transport::expire_path(dest_hash);")
+            .expect("race_path must unconditionally expire any cached path");
+        let race_request = race_fragment
+            .find("Transport::request_path(dest_hash, None, Some(iface.clone()), None, None);")
+            .expect("race_path must issue request_path");
+        assert!(
+            race_expire < race_request,
+            "race_path must drop cached paths before issuing fresh path requests"
+        );
+
+        let verified_expire = verified_fragment
+            .find("Transport::expire_path(dest_hash);")
+            .expect("race_path_verified_this_session must unconditionally expire any cached path");
+        let verified_request = verified_fragment
+            .find("Transport::request_path(dest_hash, None, Some(iface.clone()), None, None);")
+            .expect("verified race must issue request_path");
+        assert!(
+            verified_expire < verified_request,
+            "race_path_verified_this_session must drop cached paths before issuing fresh path requests"
+        );
+
+        assert!(
+            production.contains("cached_path_iface_is_live(dest_hash, &candidates, false)")
+                && production.contains("cached_path_iface_is_live(dest_hash, &candidates, true)"),
+            "AppLinks must still validate the post-race iface against live candidates"
+        );
+    }
+
+    #[test]
+    fn path_races_install_transport_log_watch() {
+        let src = include_str!("lib.rs");
+        let production = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source prefix must exist");
+        assert!(
+            production.contains("let _watch = PathRaceLogWatch::new(dest_hash);")
+                && production.contains("announce_log::watch_destination(dest_hash);")
+                && production.contains("announce_log::unwatch_destination(&self.dest_hash);") ,
+            "path races must temporarily opt their destination into transport announce/path logging"
+        );
+    }
+
+    #[test]
+    fn path_races_do_not_short_circuit_on_cached_paths() {
+        let src = include_str!("lib.rs");
+        let production = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source prefix must exist");
+
+        let race_start = production
+            .find("pub fn race_path(")
+            .expect("race_path must exist");
+        let verified_start = production[race_start..]
+            .find("pub fn race_path_verified_this_session(")
+            .map(|idx| race_start + idx)
+            .expect("race_path_verified_this_session must exist");
+        let race_fragment = &production[race_start..verified_start];
+
+        let verified_end = production[verified_start..]
+            .find("}\n}\n\nimpl AppLinks")
+            .map(|idx| verified_start + idx)
+            .expect("verified race fragment must terminate before impl AppLinks");
+        let verified_fragment = &production[verified_start..verified_end];
+
+        let race_request = race_fragment
+            .find("Transport::request_path(dest_hash, None, Some(iface.clone()), None, None);")
+            .expect("race_path must issue request_path");
+        let race_wait = race_fragment
+            .find("if Transport::wait_for_path(dest_hash, budget) {")
+            .expect("race_path must wait for a fresh path event");
+        let race_check = race_fragment
+            .find("if let Some(iface) = cached_path_iface_is_live(dest_hash, &candidates, false) {")
+            .expect("race_path must validate the resulting path");
+
+        let verified_request = verified_fragment
+            .find("Transport::request_path(dest_hash, None, Some(iface.clone()), None, None);")
+            .expect("verified race must issue request_path");
+        let verified_wait = verified_fragment
+            .find("if Transport::wait_for_path_verified_this_session(dest_hash, budget) {")
+            .expect("verified race must wait for a fresh verified path event");
+        let verified_check = verified_fragment
+            .find("if let Some(iface) = cached_path_iface_is_live(dest_hash, &candidates, true) {")
+            .expect("verified race must validate the resulting verified path");
+
+        assert!(
+            race_request < race_wait
+                && race_wait < race_check
+                && verified_request < verified_wait
+                && verified_wait < verified_check,
+            "path races must not immediately accept cached paths before issuing a fresh path request"
         );
     }
 }
