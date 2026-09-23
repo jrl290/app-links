@@ -1330,6 +1330,23 @@ impl AppLinks {
         on_propagation_needed: Arc<dyn Fn() + Send + Sync + 'static>,
         on_failed: Arc<dyn Fn() + Send + Sync + 'static>,
     ) {
+        // No announce knowledge here: the reference assumes compression is
+        // supported when the peer's app_data says nothing (LXMF/LXMF.py).
+        Self::send_with_compression(dest, packed, true, on_delivered, on_propagation_needed, on_failed);
+    }
+
+    /// `send` with the peer's compression support decided by the caller
+    /// (LXMF: `compression_support_from_app_data` on the peer's announce).
+    /// A message over the link MDU travels as a Resource; `compress` is that
+    /// Resource's auto-compress switch.
+    pub fn send_with_compression(
+        dest: &[u8],
+        packed: Vec<u8>,
+        compress: bool,
+        on_delivered: Arc<dyn Fn() + Send + Sync + 'static>,
+        on_propagation_needed: Arc<dyn Fn() + Send + Sync + 'static>,
+        on_failed: Arc<dyn Fn() + Send + Sync + 'static>,
+    ) {
         let dest_owned = dest.to_vec();
         std::thread::Builder::new()
             .name("app_links_send".into())
@@ -1337,6 +1354,7 @@ impl AppLinks {
                 Self::run_tier_chain(
                     &dest_owned,
                     packed,
+                    compress,
                     on_delivered,
                     on_propagation_needed,
                     on_failed,
@@ -1386,6 +1404,7 @@ impl AppLinks {
     fn run_tier_chain(
         dest: &[u8],
         packed: Vec<u8>,
+        compress: bool,
         on_delivered: Arc<dyn Fn() + Send + Sync + 'static>,
         on_propagation_needed: Arc<dyn Fn() + Send + Sync + 'static>,
         on_failed: Arc<dyn Fn() + Send + Sync + 'static>,
@@ -1432,8 +1451,10 @@ impl AppLinks {
             Self::fire_on_link(
                 &handle,
                 &packed,
+                compress,
                 delivered.clone(),
                 on_delivered.clone(),
+                None,
             )
         } else {
             false
@@ -1470,8 +1491,10 @@ impl AppLinks {
             Self::fire_on_link(
                 &handle,
                 &packed,
+                compress,
                 delivered.clone(),
                 on_delivered.clone(),
+                None,
             )
         } else {
             false
@@ -1499,6 +1522,7 @@ impl AppLinks {
         Self::run_tier3(
             dest,
             &packed,
+            compress,
             delivered,
             on_delivered,
             on_failed,
@@ -1538,6 +1562,7 @@ impl AppLinks {
     fn run_tier3(
         dest: &[u8],
         packed: &[u8],
+        compress: bool,
         delivered: Arc<AtomicBool>,
         on_delivered: Arc<dyn Fn() + Send + Sync + 'static>,
         on_failed: Arc<dyn Fn() + Send + Sync + 'static>,
@@ -1731,53 +1756,58 @@ impl AppLinks {
             return;
         }
 
-        // Fire and wait for LRPROOF.
-        // Interruptible proof wait: the delivery callback sends on proof_tx so
-        // this thread wakes immediately when the proof arrives rather than
-        // sleeping the full LIVENESS_BUDGET.
-        // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
-        let (proof_tx, proof_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        // Fire and wait for the OUTCOME: the delivery proof, or the stack's
+        // own failure event (the link packet's RTT-scaled receipt timeout,
+        // or the Resource concluding without COMPLETE), as RNS/LXMF do.
+        // Until 2026-09-23 this waited a fixed LIVENESS_BUDGET (5 s) after
+        // the link came up and then declared failure while a transfer was
+        // still in flight: on a 3 s RTT link a Resource cannot finish in 5 s,
+        // so every direct message over the MDU "failed" and went to
+        // propagation. The 5-second promise to the user is Timer P above
+        // (propagation fallback), not this wait.
+        // Interruptible: the callbacks send on outcome_tx so this thread
+        // wakes at once. NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+        let (outcome_tx, outcome_rx) = std::sync::mpsc::sync_channel::<bool>(2);
         let proof_on_delivered = on_delivered.clone();
+        let proof_tx = outcome_tx.clone();
         let proof_cb: Arc<dyn Fn() + Send + Sync + 'static> = Arc::new(move || {
             proof_on_delivered();
-            let _ = proof_tx.send(());
+            let _ = proof_tx.try_send(true);
         });
-
+        let fail_tx = outcome_tx;
+        let fail_cb: Arc<dyn Fn() + Send + Sync + 'static> = Arc::new(move || {
+            let _ = fail_tx.try_send(false);
+        });
         let fired = Self::fire_on_link(
             &established_handle,
             &packed,
+            compress,
             delivered.clone(),
             proof_cb,
+            Some(fail_cb),
         );
         if !fired {
             Self::fire_failed_if_undelivered(&delivered, &on_failed);
             return;
         }
-
-        // Block until proof arrives or the budget expires.
-        // recv_timeout wakes immediately on proof; no wasted sleep.
-        // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
-        match proof_rx.recv_timeout(LIVENESS_BUDGET) {
-            Ok(()) => {
+        match outcome_rx.recv_timeout(OUTCOME_BACKSTOP) {
+            Ok(true) => {
                 log(
-                    &format!(
-                        "[APP_LINK] send delivered via tier-3 for {}",
-                        hexrep(dest, false)
-                    ),
-                    LOG_NOTICE,
-                    false,
-                    false,
+                    &format!("[APP_LINK] send delivered via tier-3 for {}", hexrep(dest, false)),
+                    LOG_NOTICE, false, false,
                 );
+            }
+            Ok(false) => {
+                log(
+                    &format!("[APP_LINK] send tier-3: the stack reported delivery failed (receipt timed out or Resource failed) for {}", hexrep(dest, false)),
+                    LOG_NOTICE, false, false,
+                );
+                Self::fire_failed_if_undelivered(&delivered, &on_failed);
             }
             Err(_) => {
                 log(
-                    &format!(
-                        "[APP_LINK] send tier-3: delivery proof timed out for {}",
-                        hexrep(dest, false)
-                    ),
-                    LOG_NOTICE,
-                    false,
-                    false,
+                    &format!("[APP_LINK] send tier-3: no outcome from the stack within the backstop for {}", hexrep(dest, false)),
+                    LOG_NOTICE, false, false,
                 );
                 Self::fire_failed_if_undelivered(&delivered, &on_failed);
             }
@@ -1792,11 +1822,13 @@ impl AppLinks {
     fn fire_on_link(
         link: &LinkHandle,
         packed: &[u8],
+        compress: bool,
         delivered: Arc<AtomicBool>,
         on_delivered: Arc<dyn Fn() + Send + Sync + 'static>,
+        on_outcome_failed: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
     ) -> bool {
         if link_representation(packed.len()) == LinkRepresentation::Resource {
-            return Self::fire_resource_on_link(link, packed, delivered, on_delivered);
+            return Self::fire_resource_on_link(link, packed, compress, delivered, on_delivered, on_outcome_failed);
         }
         let Ok(dest) = link.build_link_destination() else {
             return false;
@@ -1824,6 +1856,14 @@ impl AppLinks {
             });
         receipt.set_delivery_callback(dcb.clone());
         Transport::set_receipt_delivery_callback(&receipt.hash, dcb);
+        // The receipt's own RTT-scaled timeout (RNS/Packet.py PacketReceipt)
+        // is the failure event for a link packet.
+        if let Some(failed) = on_outcome_failed {
+            let tcb: Arc<dyn Fn(&reticulum_rust::packet::PacketReceipt) + Send + Sync> =
+                Arc::new(move |_| failed());
+            receipt.set_timeout_callback(tcb.clone());
+            Transport::set_receipt_timeout_callback(&receipt.hash, tcb);
+        }
         true
     }
 
@@ -1837,20 +1877,28 @@ impl AppLinks {
     fn fire_resource_on_link(
         link: &LinkHandle,
         packed: &[u8],
+        compress: bool,
         delivered: Arc<AtomicBool>,
         on_delivered: Arc<dyn Fn() + Send + Sync + 'static>,
+        on_outcome_failed: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
     ) -> bool {
         use reticulum_rust::resource::{AutoCompressOption, Resource, ResourceData, ResourceStatus};
         if !link.is_active() {
             return false;
         }
+        // The Resource's own RTT-scaled timeouts (RNS/Resource.py) decide the
+        // outcome; concluded with any status but COMPLETE is the failure.
         let concluded: Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync> = Arc::new(move |resource| {
             let complete = resource
                 .lock()
                 .map(|r| matches!(r.status, ResourceStatus::Complete))
                 .unwrap_or(false);
-            if complete && !delivered.swap(true, Ordering::AcqRel) {
-                on_delivered();
+            if complete {
+                if !delivered.swap(true, Ordering::AcqRel) {
+                    on_delivered();
+                }
+            } else if let Some(failed) = &on_outcome_failed {
+                failed();
             }
         });
         match Resource::new_internal(
@@ -1858,7 +1906,7 @@ impl AppLinks {
             link.clone(),
             None,
             false,
-            AutoCompressOption::Enabled,
+            if compress { AutoCompressOption::Enabled } else { AutoCompressOption::Disabled },
             Some(concluded),
             None,
             None,
@@ -1915,6 +1963,11 @@ pub const LIVENESS_CACHE_TTL: Duration = Duration::from_secs(2);
 /// 5-second deterministic upper bound for the liveness race.
 /// (DESIGN_PRINCIPLES §1).  Late success past this point is a defect.
 const LIVENESS_BUDGET: Duration = Duration::from_secs(5);
+
+/// Backstop on the tier-3 outcome wait. The outcome itself comes from the
+/// stack's own RTT-scaled timeouts (packet receipt, Resource); this only
+/// guards against a lost callback and is never what decides a send.
+const OUTCOME_BACKSTOP: Duration = Duration::from_secs(120);
 
 /// How long to wait before firing `on_propagation_needed`.
 /// Matches §1's 5-second network-action limit.
