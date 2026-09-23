@@ -1795,6 +1795,9 @@ impl AppLinks {
         delivered: Arc<AtomicBool>,
         on_delivered: Arc<dyn Fn() + Send + Sync + 'static>,
     ) -> bool {
+        if link_representation(packed.len()) == LinkRepresentation::Resource {
+            return Self::fire_resource_on_link(link, packed, delivered, on_delivered);
+        }
         let Ok(dest) = link.build_link_destination() else {
             return false;
         };
@@ -1822,6 +1825,80 @@ impl AppLinks {
         receipt.set_delivery_callback(dcb.clone());
         Transport::set_receipt_delivery_callback(&receipt.hash, dcb);
         true
+    }
+
+    /// Send `packed` as a Resource on `link` (LXMF/LXMessage.py: a message
+    /// larger than the link MDU has the RESOURCE representation and is
+    /// delivered by `RNS.Resource(packed, link)`; `__resource_concluded`
+    /// marks it delivered when the status is COMPLETE). Until 2026-09-23
+    /// every direct message left here as ONE link packet, so anything over
+    /// the MDU never left the phone: the packet could not be built, the
+    /// receipt timed out, and the 5-second fallback propagated it instead.
+    fn fire_resource_on_link(
+        link: &LinkHandle,
+        packed: &[u8],
+        delivered: Arc<AtomicBool>,
+        on_delivered: Arc<dyn Fn() + Send + Sync + 'static>,
+    ) -> bool {
+        use reticulum_rust::resource::{AutoCompressOption, Resource, ResourceData, ResourceStatus};
+        if !link.is_active() {
+            return false;
+        }
+        let concluded: Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync> = Arc::new(move |resource| {
+            let complete = resource
+                .lock()
+                .map(|r| matches!(r.status, ResourceStatus::Complete))
+                .unwrap_or(false);
+            if complete && !delivered.swap(true, Ordering::AcqRel) {
+                on_delivered();
+            }
+        });
+        match Resource::new_internal(
+            Some(ResourceData::Bytes(packed.to_vec())),
+            link.clone(),
+            None,
+            false,
+            AutoCompressOption::Enabled,
+            Some(concluded),
+            None,
+            None,
+            1,
+            None,
+            None,
+            false,
+            0,
+            None,
+        ) {
+            Ok(resource) => {
+                Resource::advertise_shared(Arc::new(Mutex::new(resource)));
+                true
+            }
+            Err(e) => {
+                log(
+                    &format!("[APP_LINK] could not build the delivery Resource ({} B): {}", packed.len(), e),
+                    LOG_NOTICE, false, false,
+                );
+                false
+            }
+        }
+    }
+}
+
+/// How a packed LXMF message travels on a link: one packet up to the link
+/// MDU, a Resource above it (LXMF/LXMessage.py pack(): `content_size <=
+/// LINK_PACKET_MAX_CONTENT` chooses PACKET, else RESOURCE; the packed size
+/// against `RNS.Link.MDU` is the same boundary).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkRepresentation {
+    Packet,
+    Resource,
+}
+
+pub fn link_representation(packed_len: usize) -> LinkRepresentation {
+    if packed_len > reticulum_rust::link::MDU {
+        LinkRepresentation::Resource
+    } else {
+        LinkRepresentation::Packet
     }
 }
 
@@ -2264,6 +2341,16 @@ mod tests {
 
     // §O5 — Tier-1 delivery is still accepted after tier-2 has started.
     // The delivered gate must remain open to any tier at any time.
+    #[test]
+    fn a_message_over_the_link_mdu_travels_as_a_resource() {
+        use super::{link_representation, LinkRepresentation};
+        let mdu = reticulum_rust::link::MDU;
+        assert_eq!(link_representation(1), LinkRepresentation::Packet);
+        assert_eq!(link_representation(mdu), LinkRepresentation::Packet, "exactly the MDU still fits one packet");
+        assert_eq!(link_representation(mdu + 1), LinkRepresentation::Resource, "one byte over the MDU is a Resource");
+        assert_eq!(link_representation(1700), LinkRepresentation::Resource);
+    }
+
     #[test]
     fn tier1_delivery_accepted_after_tier2_starts() {
         let delivered = Arc::new(AtomicBool::new(false));
