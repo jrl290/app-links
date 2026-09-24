@@ -677,6 +677,105 @@ impl AppLinks {
         }
     }
 
+    /// Forget every registration and tear down every held link, outbound
+    /// and inbound.
+    ///
+    /// The registry is process-global and outlives the Reticulum instance.
+    /// A host that stops and starts the stack inside one process (Android
+    /// `StackRuntime.restart` on 2026-09-24) otherwise leaves the new stack
+    /// holding `STATE_ACTIVE` handles whose interfaces are gone: the router
+    /// "sends" on them and nothing leaves the device. The host calls this
+    /// from its stack shutdown; routers re-register their callbacks and
+    /// persistent links when they come back.
+    pub fn close_all() -> usize {
+        let (outbound, inbound, dests) = {
+            let mut reg = REGISTRY.lock().expect("app_links registry mutex poisoned");
+            let dests: Vec<Vec<u8>> = reg.specs.keys().cloned().collect();
+            reg.specs.clear();
+            reg.ready.clear();
+            reg.prop_fallback_disconnected.clear();
+            let outbound: Vec<LinkHandle> = reg.links.drain().map(|(_, h)| h).collect();
+            let inbound: Vec<LinkHandle> = reg.inbound_links.drain().map(|(_, h)| h).collect();
+            (outbound, inbound, dests)
+        };
+        let torn_down = outbound.len() + inbound.len();
+        for handle in outbound.iter().chain(inbound.iter()) {
+            handle.teardown();
+        }
+        if let Ok(mut cache) = LIVENESS_CACHE.lock() {
+            cache.clear();
+        }
+        let cbs: Vec<AppLinkStatusCallback> = REGISTRY
+            .lock()
+            .map(|mut r| std::mem::take(&mut r.status_callbacks))
+            .unwrap_or_default();
+        for dest in &dests {
+            for cb in &cbs {
+                cb(dest, APP_LINK_NONE, None);
+            }
+        }
+        log(
+            &format!(
+                "[APP_LINK] close_all: {} registration(s) dropped, {} link(s) torn down",
+                dests.len(),
+                torn_down
+            ),
+            LOG_NOTICE,
+            false,
+            false,
+        );
+        torn_down
+    }
+
+    /// Tear down the held outbound link to `dest_hash` and keep its
+    /// registration, so a persistent link re-opens under the normal
+    /// close-triggered policy. This is what the reference does when a link
+    /// packet's receipt times out (LXMF/LXMessage.py
+    /// `__link_packet_timed_out`: `packet_receipt.destination.teardown()`).
+    /// Returns `false` when no link is held.
+    pub fn teardown_held_link(dest_hash: &[u8]) -> bool {
+        let handle = REGISTRY
+            .lock()
+            .ok()
+            .and_then(|r| r.links.get(dest_hash).cloned());
+        match handle {
+            Some(handle) => {
+                Self::arm_reconnect_if_persistent(dest_hash);
+                handle.teardown();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Send `packed` over the held `STATE_ACTIVE` link to `dest_hash` and
+    /// report the outcome the way the reference does for a propagation
+    /// transfer (LXMF/LXMessage.py `send`, PROPAGATED): `on_delivered` when
+    /// the link packet is proved or the Resource completes, `on_failed` when
+    /// the packet receipt times out or the Resource fails. Nothing is raced,
+    /// re-sent or timed here beyond the stack's own receipt timeout; the
+    /// caller owns the message state.
+    ///
+    /// Returns `Err` when no active link is held or the packet could not be
+    /// queued, in which case neither callback fires.
+    pub fn send_on_held_link(
+        dest_hash: &[u8],
+        packed: Vec<u8>,
+        compress: bool,
+        on_delivered: Arc<dyn Fn() + Send + Sync + 'static>,
+        on_failed: Arc<dyn Fn() + Send + Sync + 'static>,
+    ) -> Result<(), String> {
+        let link = Self::get_handle(dest_hash)
+            .filter(|handle| handle.status() == STATE_ACTIVE)
+            .ok_or_else(|| format!("no active link held for {}", hexrep(dest_hash, false)))?;
+        let delivered = Arc::new(AtomicBool::new(false));
+        if Self::fire_on_link(&link, &packed, compress, delivered, on_delivered, Some(on_failed)) {
+            Ok(())
+        } else {
+            Err(format!("packet could not be queued on the link to {}", hexrep(dest_hash, false)))
+        }
+    }
+
     /// Current status for `dest_hash`.
     ///
     ///   * `APP_LINK_NONE`           — not registered.
@@ -2215,6 +2314,69 @@ mod tests {
                 on_prop();
             }
         });
+    }
+
+    /// close_all drops every registration and tells the host so. The
+    /// registry is process-global; a stack restarted in the same process
+    /// must not inherit the previous stack's links.
+    #[test]
+    fn close_all_drops_registrations_and_reports_none() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        reset_registry_for_test();
+        let a: Vec<u8> = (0u8..16).map(|i| i.wrapping_mul(7)).collect();
+        let b: Vec<u8> = (0u8..16).map(|i| i.wrapping_mul(11)).collect();
+        {
+            let mut reg = REGISTRY.lock().unwrap();
+            reg.specs.insert(a.clone(), AppLinkSpec::with_mode("lxmf", vec!["propagation".into()], LinkMode::Persistent));
+            reg.specs.insert(b.clone(), AppLinkSpec::with_mode("lxmf", vec!["delivery".into()], LinkMode::EphemeralLink));
+            reg.ready.insert(b.clone(), Instant::now());
+            reg.prop_fallback_disconnected.insert(a.clone());
+        }
+        let seen: Arc<Mutex<Vec<(Vec<u8>, u8)>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_cb = seen.clone();
+        AppLinks::register_status_callback(Arc::new(move |dest, status, _| {
+            seen_cb.lock().unwrap().push((dest.to_vec(), status));
+        }));
+
+        let torn_down = AppLinks::close_all();
+
+        assert_eq!(torn_down, 0, "no handles were held");
+        assert!(!AppLinks::contains(&a) && !AppLinks::contains(&b), "registrations must be gone");
+        assert_eq!(AppLinks::status(&a), APP_LINK_NONE);
+        assert_eq!(AppLinks::status(&b), APP_LINK_NONE);
+        let mut reported = seen.lock().unwrap().clone();
+        reported.sort();
+        let mut expected = vec![(a.clone(), APP_LINK_NONE), (b.clone(), APP_LINK_NONE)];
+        expected.sort();
+        assert_eq!(reported, expected, "every dropped registration reports NONE once");
+        {
+            let reg = REGISTRY.lock().unwrap();
+            assert!(reg.status_callbacks.is_empty(), "host callbacks belong to the stack that registered them");
+            assert!(reg.prop_fallback_disconnected.is_empty());
+        }
+        reset_registry_for_test();
+    }
+
+    /// send_on_held_link fires no callback and reports the error when no
+    /// active link is held: the caller keeps its message OUTBOUND.
+    #[test]
+    fn send_on_held_link_without_active_link_is_an_error() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        reset_registry_for_test();
+        let dest: Vec<u8> = (0u8..16).map(|i| i.wrapping_mul(13)).collect();
+        let fired = Arc::new(AtomicBool::new(false));
+        let (f1, f2) = (fired.clone(), fired.clone());
+        let result = AppLinks::send_on_held_link(
+            &dest,
+            vec![1, 2, 3],
+            true,
+            Arc::new(move || f1.store(true, Ordering::Release)),
+            Arc::new(move || f2.store(true, Ordering::Release)),
+        );
+        assert!(result.is_err());
+        assert!(!fired.load(Ordering::Acquire), "no callback without a send");
+        assert!(!AppLinks::teardown_held_link(&dest), "nothing held to tear down");
+        reset_registry_for_test();
     }
 
     // §O1 — Timer P fires on_propagation_needed when message not delivered.
