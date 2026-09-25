@@ -141,6 +141,7 @@ pub const DUAL_LINK_SETTLING_SECS: u64 = 720;
 /// | `open()`                       |     ✓      |     ✓      |     ✗     |
 /// | `announce_received()`          |     ✓      |     ✓      |     ✗     |
 /// | `network_changed()`            |     ✓      |     ✗      |     ✗     |
+/// | interface up-edge (Transport)  |     ✓      |     ✗      |     ✗     |
 /// | post-ACTIVE auto-retry (close) |     ✓      |     ✗      |     ✗     |
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LinkPolicy {
@@ -546,6 +547,22 @@ impl AppLinks {
             .and_then(|r| r.specs.get(dest_hash).cloned())
     }
 
+    /// Register `spec` for `dest_hash`.  A re-registration in the same mode
+    /// keeps the in-flight guard of the spec it replaces: the attempt that
+    /// guard covers is still running.  A fresh guard let the next trigger
+    /// start a second attempt beside it — on 2026-09-25 a reconnect opened
+    /// two links to the propagation node, and the one no longer tracked
+    /// was never torn down.
+    fn register_spec(dest_hash: &[u8], mut spec: AppLinkSpec) {
+        let mut reg = REGISTRY.lock().expect("app_links registry mutex poisoned");
+        if let Some(existing) = reg.specs.get(dest_hash) {
+            if existing.mode == spec.mode {
+                spec.attempt_in_flight = existing.attempt_in_flight.clone();
+            }
+        }
+        reg.specs.insert(dest_hash.to_vec(), spec);
+    }
+
     // ─── Public lifecycle ─────────────────────────────────────────────
 
     /// Register `dest_hash` for liveness tracking.  Races a path, marks
@@ -575,6 +592,7 @@ impl AppLinks {
         mode: LinkMode,
     ) {
         Self::ensure_announce_handler();
+        Self::ensure_interface_up_hook();
 
         let previous_status = Self::status(dest_hash);
         let previous_outbound_live = Self::outbound_link_live(dest_hash);
@@ -585,10 +603,7 @@ impl AppLinks {
             mode,
         );
 
-        {
-            let mut reg = REGISTRY.lock().expect("app_links registry mutex poisoned");
-            reg.specs.insert(dest_hash.to_vec(), spec);
-        }
+        Self::register_spec(dest_hash, spec);
 
         Transport::watch_announce(dest_hash.to_vec());
 
@@ -928,6 +943,25 @@ impl AppLinks {
     /// Trigger one fresh attempt for every app-link not currently active.
     /// Call from the host on a network state change.
     pub fn network_changed() {
+        Self::attempt_inactive_links("network-change trigger");
+    }
+
+    /// An interface came online (Transport's up-edge): one fresh attempt for
+    /// every app-link not currently active, as for a network change. A link
+    /// attempt that failed for want of an interface ("no usable interface")
+    /// is not retried by design (§3), so without this a link stayed down
+    /// after its interface came back — until 2026-09-25 an Android phone's
+    /// RFed links stayed down after its TCP interface reconnected, until
+    /// the app was restarted. A network change is not the only way an
+    /// interface returns: a TCP reconnect after the peer restarted, or after
+    /// the OS unblocked the app's network, changes no network.
+    fn interface_online(name: &str) {
+        Self::attempt_inactive_links(&format!("interface {} online", name));
+    }
+
+    /// One fresh attempt for every registered app-link that is neither
+    /// active nor establishing, in the foreground only (see LinkPolicy).
+    fn attempt_inactive_links(trigger: &str) {
         if Self::policy() != LinkPolicy::Foreground {
             return;
         }
@@ -943,7 +977,8 @@ impl AppLinks {
         }
         log(
             &format!(
-                "[APP_LINK] network-change trigger → attempting {} link(s)",
+                "[APP_LINK] {} → attempting {} link(s)",
+                trigger,
                 candidates.len()
             ),
             LOG_NOTICE,
@@ -1021,6 +1056,14 @@ impl AppLinks {
             aspect_filter: None,
             receive_path_responses: true,
             callback,
+        });
+    }
+
+    /// Single-use subscription to Transport's interface up-edge. Idempotent.
+    fn ensure_interface_up_hook() {
+        static HOOKED: std::sync::Once = std::sync::Once::new();
+        HOOKED.call_once(|| {
+            Transport::add_interface_up_listener(Arc::new(|name: &str| AppLinks::interface_online(name)));
         });
     }
 
@@ -1486,10 +1529,7 @@ impl AppLinks {
             LinkMode::EphemeralLink,
         );
 
-        {
-            let mut reg = REGISTRY.lock().expect("app_links registry mutex poisoned");
-            reg.specs.insert(dest.to_vec(), spec);
-        }
+        Self::register_spec(dest, spec);
 
         Transport::watch_announce(dest.to_vec());
         Self::send(dest, packed, on_delivered, on_propagation_needed, on_failed);
@@ -2502,6 +2542,55 @@ mod tests {
         reset_registry_for_test();
     }
 
+    // A reconnect on 2026-09-25 opened two links to the propagation node:
+    // a second open replaced the spec mid-attempt, and its fresh in-flight
+    // guard let a second attempt start beside the first.
+    #[test]
+    fn reopening_a_link_mid_attempt_keeps_the_attempt_guard() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        reset_registry_for_test();
+
+        let dest = b"prop-node".to_vec();
+        let running = AppLinkSpec::with_mode("lxmf", vec!["propagation".into()], LinkMode::Persistent);
+        running.attempt_in_flight.store(true, Ordering::Release);
+        AppLinks::register_spec(&dest, running.clone());
+
+        AppLinks::register_spec(
+            &dest,
+            AppLinkSpec::with_mode("lxmf", vec!["propagation".into()], LinkMode::Persistent),
+        );
+        let reopened = AppLinks::spec(&dest).expect("still registered");
+        assert!(
+            Arc::ptr_eq(&reopened.attempt_in_flight, &running.attempt_in_flight),
+            "the running attempt's guard must carry over"
+        );
+        assert!(
+            reopened
+                .attempt_in_flight
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err(),
+            "a second attempt must be refused while the first runs"
+        );
+
+        // The attempt ends and clears the guard it holds: the next open sees it.
+        running.attempt_in_flight.store(false, Ordering::Release);
+        assert!(!AppLinks::spec(&dest).unwrap().attempt_in_flight.load(Ordering::Acquire));
+
+        // A change of mode is a different attempt, with a guard of its own.
+        running.attempt_in_flight.store(true, Ordering::Release);
+        AppLinks::register_spec(&dest, AppLinkSpec::new("lxmf", vec!["propagation".into()]));
+        assert!(!AppLinks::spec(&dest).unwrap().attempt_in_flight.load(Ordering::Acquire));
+
+        let production = include_str!("lib.rs").split("#[cfg(test)]").next().unwrap();
+        assert_eq!(
+            production.matches("reg.specs.insert(").count(),
+            1,
+            "every registration must go through register_spec"
+        );
+
+        reset_registry_for_test();
+    }
+
     // §O3 — Delivered gate fires exactly once under concurrent tier delivery.
     #[test]
     fn delivered_gate_fires_exactly_once() {
@@ -2614,6 +2703,46 @@ mod tests {
             LinkMode::Persistent,
         );
         assert_eq!(spec.mode, LinkMode::Persistent);
+    }
+
+    /// An interface coming back online re-attempts the links that are down,
+    /// like a network change: every open subscribes AppLinks to Transport's
+    /// up-edge, once, and both triggers share one foreground-gated path.
+    #[test]
+    fn an_interface_coming_online_reattempts_links_that_are_down() {
+        let src = include_str!("lib.rs");
+        let production = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source prefix must exist");
+        assert!(production.contains(
+            "Transport::add_interface_up_listener(Arc::new(|name: &str| AppLinks::interface_online(name)));"
+        ));
+        assert!(production.contains("HOOKED.call_once("), "subscribed once per process");
+        let open = production
+            .split("pub fn open_with_mode(")
+            .nth(1)
+            .expect("open_with_mode")
+            .split("let previous_status")
+            .next()
+            .unwrap();
+        assert!(open.contains("Self::ensure_interface_up_hook();"), "every open subscribes");
+        assert!(production.contains(
+            "Self::attempt_inactive_links(&format!(\"interface {} online\", name));"
+        ));
+        assert!(production.contains("Self::attempt_inactive_links(\"network-change trigger\");"));
+        let attempt = production
+            .split("fn attempt_inactive_links(trigger: &str) {")
+            .nth(1)
+            .expect("attempt_inactive_links");
+        assert!(
+            attempt.trim_start().starts_with("if Self::policy() != LinkPolicy::Foreground {"),
+            "foreground only, first"
+        );
+        assert!(
+            !production.contains("app_links_reestablish"),
+            "event-driven: no timed retry loop"
+        );
     }
 
     #[test]
