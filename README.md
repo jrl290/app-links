@@ -40,8 +40,16 @@ For direct LXMF delivery, AppLinks acts as a send orchestrator.
 	then fresh outbound link.
 - It tracks inbound delivery links opened by peers so later sends can reuse
 	them as the first tier.
-- It owns the 5-second propagation fallback trigger used when direct delivery
-	has not completed.
+- It owns the 5-second propagation fallback trigger (Timer P) used when direct
+	delivery has not completed. The 5 seconds count only time without transfer
+	activity: a message over the link MDU travels as a Resource, and each
+	request the receiver makes that brings more of it sent starts them again,
+	so a transfer that is moving gets no propagated backup copy. The tier-3
+	outcome backstop (120 s) counts the same way.
+- It reports a Resource transfer's progress to the caller
+	(`send_with_compression` / `send_on_held_link`, `SendProgressCallback`):
+	the raw `Resource::get_progress` fraction after each request served, until
+	delivery. A message that fits one link packet reports nothing.
 
 In other words, for direct LXMF delivery AppLinks is not just keeping a link
 alive. It decides how the send is attempted and which link path is used.

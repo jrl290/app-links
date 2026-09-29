@@ -58,12 +58,19 @@
 //!
 //! `AppLinks::send(dest, packed, on_delivered, on_propagation_needed, on_failed)` drives:
 //!
-//! Timer P starts in parallel the moment `send` is called.  Normally it uses
-//! the 5 s liveness budget, but when the current APP_LINK status is already
-//! `DISCONNECTED` it fires immediately so propagation can start in parallel
-//! with the fresh direct cascade.
-//! If the
-//! message is not delivered by then, `on_propagation_needed` fires once.
+//! Timer P starts in parallel the moment `send` is called.  It counts only
+//! time WITHOUT transfer activity: `on_propagation_needed` fires once the
+//! send has gone the 5 s liveness budget undelivered and without its
+//! transfer moving, and never after delivery.  A message over the link MDU
+//! travels as a Resource, and each request the receiver makes that brings
+//! more of it sent is activity that restarts the 5 s; a transfer that is
+//! making progress is not stuck, and a propagated backup copy of it would
+//! upload the whole payload a second time.  (Until 2026-09-29 Timer P fired
+//! 5 s after `send` whatever the transfer was doing: an iPad photo, 1708
+//! parts over a Nearby RTNode Bluetooth link, got a backup copy 5 s into a
+//! direct transfer that went on to deliver.)  When the current APP_LINK
+//! status is already `DISCONNECTED` it fires immediately so propagation can
+//! start in parallel with the fresh direct cascade.
 //! This is independent of the tier chain.
 //!
 //!   * **Tier 1** — peer-initiated inbound link (they opened it to us):
@@ -72,8 +79,17 @@
 //!   * **Tier 2** — cached outbound link (`STATE_ACTIVE`): fire, wait ≤1 s
 //!     (Timer B).  DO NOT tear down tier-1's in-flight packet.
 //!   * **Tier 3** — `expire_path` → `race_path` (≤5 s) → `Link::new_outbound`
-//!     + `initiate` (≤5 s) → fire packet → wait for delivery proof (≤5 s).
-//!     `on_failed` fires only when tier 3 exhausts all protocol timeouts.
+//!     + `initiate` (≤5 s) → fire → wait for the stack's outcome: the
+//!     delivery proof, the link packet's receipt timeout, or the Resource
+//!     concluding.  `on_failed` fires on the stack's failure event, or when
+//!     the 120 s backstop passes with no outcome AND no transfer activity
+//!     (since 2026-09-29; it used to fail a Resource that was still moving
+//!     once 120 s had passed since the fire).
+//!
+//! `send_with_compression` and `send_on_held_link` take an optional progress
+//! callback that hears the Resource's own fraction (`Resource::get_progress`,
+//! RNS/Resource.py `get_progress`) after each request the receiver makes,
+//! until delivery.  A payload that fits one link packet reports nothing.
 //!
 //! All tiers share an `AtomicBool` delivered gate — the first delivery proof
 //! from any tier wins and the others are silently ignored (idempotent).
@@ -180,6 +196,18 @@ pub type InboundPacketCallback =
 /// Optional hook fired when a peer establishes a link to a destination that
 /// has been wired via [`AppLinks::wire_inbound_destination`].
 pub type InboundLinkEstablishedCallback = Arc<dyn Fn() + Send + Sync + 'static>;
+
+/// Transfer progress of a send that travels as a Resource: the raw fraction
+/// (0.0..=1.0) the sending Resource reports through `Resource::get_progress`
+/// (RNS/Resource.py `get_progress`), called after each request the receiver
+/// makes, until the send is delivered.  The caller maps it onto its own
+/// scale (LXMF: 0.10 + 0.90 × fraction, LXMF/LXMessage.py
+/// `__update_transfer_progress`).  With several tiers in flight each tier's
+/// Resource reports its own fraction, so the values need not rise
+/// monotonically.  A send that fits one link packet reports nothing.
+/// Keep it short: it runs on the thread serving the receiver's request,
+/// with that Resource's lock held, and must never wait on the link.
+pub type SendProgressCallback = Arc<dyn Fn(f64) + Send + Sync + 'static>;
 
 /// Per-destination lifecycle mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -771,20 +799,26 @@ impl AppLinks {
     /// re-sent or timed here beyond the stack's own receipt timeout; the
     /// caller owns the message state.
     ///
+    /// `on_progress` hears the Resource's fraction while a payload over the
+    /// link MDU transfers ([`SendProgressCallback`]); a packet reports
+    /// nothing.
+    ///
     /// Returns `Err` when no active link is held or the packet could not be
-    /// queued, in which case neither callback fires.
+    /// queued, in which case no callback fires.
     pub fn send_on_held_link(
         dest_hash: &[u8],
         packed: Vec<u8>,
         compress: bool,
         on_delivered: Arc<dyn Fn() + Send + Sync + 'static>,
         on_failed: Arc<dyn Fn() + Send + Sync + 'static>,
+        on_progress: Option<SendProgressCallback>,
     ) -> Result<(), String> {
         let link = Self::get_handle(dest_hash)
             .filter(|handle| handle.status() == STATE_ACTIVE)
             .ok_or_else(|| format!("no active link held for {}", hexrep(dest_hash, false)))?;
         let delivered = Arc::new(AtomicBool::new(false));
-        if Self::fire_on_link(&link, &packed, compress, delivered, on_delivered, Some(on_failed)) {
+        let watch = TransferWatch::new(on_progress);
+        if Self::fire_on_link(&link, &packed, compress, delivered, on_delivered, Some(on_failed), &watch) {
             Ok(())
         } else {
             Err(format!("packet could not be queued on the link to {}", hexrep(dest_hash, false)))
@@ -1450,7 +1484,9 @@ impl AppLinks {
     //   Tier 3 — expire_path + race_path + Link::new_outbound + send.
     //
     // Each tier fires at t=0, t=1s, t=2s respectively (Timer A/B).  A
-    // parallel Timer P fires on_propagation_needed at t=5s if not delivered.
+    // parallel Timer P fires on_propagation_needed once the send has gone
+    // 5 s undelivered with no transfer activity (a Resource reporting more
+    // of the message sent restarts the 5 s).
     // All tiers share an AtomicBool gate; advancing never cancels prior tiers.
     //
     // Spawns a background thread; returns immediately (§7).
@@ -1461,10 +1497,14 @@ impl AppLinks {
     ///
     /// Callbacks (all MUST be idempotent and MUST NOT block):
     ///   `on_delivered`           — first delivery proof from any tier.
-    ///   `on_propagation_needed`  — 5 s elapsed without delivery; caller
-    ///                              should start a parallel propagation send.
-    ///   `on_failed`              — tier 3 exhausted all protocol timeouts
-    ///                              without delivery.
+    ///   `on_propagation_needed`  — Timer P: the send went
+    ///                              [`PROP_FALLBACK_DELAY`] (5 s) undelivered
+    ///                              with no transfer activity; caller should
+    ///                              start a parallel propagation send.
+    ///   `on_failed`              — tier 3's transfer failed (the stack's own
+    ///                              failure event), or went the 120 s
+    ///                              outcome backstop with neither an
+    ///                              outcome nor transfer activity.
     pub fn send(
         dest: &[u8],
         packed: Vec<u8>,
@@ -1474,13 +1514,14 @@ impl AppLinks {
     ) {
         // No announce knowledge here: the reference assumes compression is
         // supported when the peer's app_data says nothing (LXMF/LXMF.py).
-        Self::send_with_compression(dest, packed, true, on_delivered, on_propagation_needed, on_failed);
+        Self::send_with_compression(dest, packed, true, on_delivered, on_propagation_needed, on_failed, None);
     }
 
     /// `send` with the peer's compression support decided by the caller
     /// (LXMF: `compression_support_from_app_data` on the peer's announce).
     /// A message over the link MDU travels as a Resource; `compress` is that
-    /// Resource's auto-compress switch.
+    /// Resource's auto-compress switch, and `on_progress` hears its fraction
+    /// as it transfers ([`SendProgressCallback`]).
     pub fn send_with_compression(
         dest: &[u8],
         packed: Vec<u8>,
@@ -1488,6 +1529,7 @@ impl AppLinks {
         on_delivered: Arc<dyn Fn() + Send + Sync + 'static>,
         on_propagation_needed: Arc<dyn Fn() + Send + Sync + 'static>,
         on_failed: Arc<dyn Fn() + Send + Sync + 'static>,
+        on_progress: Option<SendProgressCallback>,
     ) {
         let dest_owned = dest.to_vec();
         std::thread::Builder::new()
@@ -1500,6 +1542,7 @@ impl AppLinks {
                     on_delivered,
                     on_propagation_needed,
                     on_failed,
+                    on_progress,
                 );
             })
             .expect("failed to spawn app_links send thread");
@@ -1547,34 +1590,47 @@ impl AppLinks {
         on_delivered: Arc<dyn Fn() + Send + Sync + 'static>,
         on_propagation_needed: Arc<dyn Fn() + Send + Sync + 'static>,
         on_failed: Arc<dyn Fn() + Send + Sync + 'static>,
+        on_progress: Option<SendProgressCallback>,
     ) {
         // Shared delivered gate.  The first delivery proof from any tier wins.
         let delivered = Arc::new(AtomicBool::new(false));
+        // Shared by every tier's Resource: the caller's progress callback and
+        // the send's activity clock, which Timer P and the tier-3 backstop
+        // read so that they count only time without transfer activity.
+        let watch = TransferWatch::new(on_progress);
         let prop_delay = Self::prop_fallback_delay_for_status(Self::status(dest));
 
         // ── Timer P: propagation fallback ─────────────────────────────
         //
-        // Fires on_propagation_needed after the computed propagation delay if
-        // the message has not been delivered by then. DISCONNECTED readiness
-        // means the UI is already red, so the delay is collapsed to zero while
-        // the direct cascade still continues in parallel. Runs on a separate
-        // thread so it is truly parallel with all tiers.
+        // Fires on_propagation_needed once the send has gone the computed
+        // propagation delay undelivered and WITHOUT transfer activity: a
+        // Resource reporting more of the message sent restarts the delay, so
+        // a transfer that is making progress gets no propagated backup copy
+        // (a second upload of the whole payload). Never fires after delivery.
+        // DISCONNECTED readiness means the UI is already red, so the delay
+        // is collapsed to zero while the direct cascade still continues in
+        // parallel. Runs on a separate thread so it is truly parallel with
+        // all tiers.
         //
         // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
         // This is the authoritative source of the propagation trigger delay.
         // The caller (lxm_router) handles the actual propagation mechanics.
         {
             let delivered_p = delivered.clone();
+            let activity_p = watch.activity.clone();
             let dest_p = dest.to_vec();
             let on_prop = on_propagation_needed;
-            Self::spawn_after("app_links_prop_timer", prop_delay, move || {
-                if !delivered_p.load(Ordering::Acquire) {
-                    if prop_delay > Duration::ZERO {
-                        AppLinks::mark_prop_fallback_disconnected(&dest_p);
-                    }
-                    on_prop();
-                }
-            });
+            std::thread::Builder::new()
+                .name("app_links_prop_timer".into())
+                .spawn(move || {
+                    Self::run_prop_timer(prop_delay, &delivered_p, &activity_p, || {
+                        if prop_delay > Duration::ZERO {
+                            AppLinks::mark_prop_fallback_disconnected(&dest_p);
+                        }
+                        on_prop();
+                    });
+                })
+                .expect("failed to spawn app-links Timer P");
         }
 
         // ── Tier 1: inbound link ──────────────────────────────────────
@@ -1594,6 +1650,7 @@ impl AppLinks {
                 delivered.clone(),
                 on_delivered.clone(),
                 None,
+                &watch,
             )
         } else {
             false
@@ -1634,6 +1691,7 @@ impl AppLinks {
                 delivered.clone(),
                 on_delivered.clone(),
                 None,
+                &watch,
             )
         } else {
             false
@@ -1665,20 +1723,34 @@ impl AppLinks {
             delivered,
             on_delivered,
             on_failed,
+            &watch,
         );
     }
 
-    fn spawn_after<F>(name: &str, delay: Duration, job: F)
-    where
-        F: FnOnce() + Send + 'static,
-    {
-        std::thread::Builder::new()
-            .name(name.to_string())
-            .spawn(move || {
-                std::thread::sleep(delay);
-                job();
-            })
-            .expect("failed to spawn app-links send scheduler");
+    /// Timer P's clock, on the Timer P thread: waits until the send has gone
+    /// `delay` without transfer activity, then runs `fire` — unless the
+    /// message was delivered, which ends the wait at its next deadline
+    /// without firing. Each report of more of the message sent pushes the
+    /// deadline to `delay` after it. Returns whether it fired.
+    fn run_prop_timer(
+        delay: Duration,
+        delivered: &AtomicBool,
+        activity: &TransferActivity,
+        fire: impl FnOnce(),
+    ) -> bool {
+        loop {
+            if delivered.load(Ordering::Acquire) {
+                return false;
+            }
+            let due = activity.quiet_deadline(delay);
+            let now = Instant::now();
+            if now >= due {
+                break;
+            }
+            std::thread::sleep(due - now);
+        }
+        fire();
+        true
     }
 
     fn prop_fallback_delay_for_status(status: u8) -> Duration {
@@ -1705,6 +1777,7 @@ impl AppLinks {
         delivered: Arc<AtomicBool>,
         on_delivered: Arc<dyn Fn() + Send + Sync + 'static>,
         on_failed: Arc<dyn Fn() + Send + Sync + 'static>,
+        watch: &TransferWatch,
     ) {
         log(
             &format!("[APP_LINK] send tier-3 (path race + new link) for {}", hexrep(dest, false)),
@@ -1904,6 +1977,11 @@ impl AppLinks {
         // so every direct message over the MDU "failed" and went to
         // propagation. The 5-second promise to the user is Timer P above
         // (propagation fallback), not this wait.
+        // Until 2026-09-29 the OUTCOME_BACKSTOP was the same mistake on a
+        // longer clock: 120 s after the fire it failed a Resource that was
+        // still moving (an iPad photo, ~4 minutes over Bluetooth, reported
+        // FAILED at 120 s and DELIVERED later). The backstop now counts only
+        // time with no outcome AND no transfer activity (`await_outcome`).
         // Interruptible: the callbacks send on outcome_tx so this thread
         // wakes at once. NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
         let (outcome_tx, outcome_rx) = std::sync::mpsc::sync_channel::<bool>(2);
@@ -1924,31 +2002,73 @@ impl AppLinks {
             delivered.clone(),
             proof_cb,
             Some(fail_cb),
+            watch,
         );
         if !fired {
             Self::fire_failed_if_undelivered(&delivered, &on_failed);
             return;
         }
-        match outcome_rx.recv_timeout(OUTCOME_BACKSTOP) {
-            Ok(true) => {
+        match Self::await_outcome(&outcome_rx, &watch.activity, OUTCOME_BACKSTOP) {
+            OutcomeWait::Delivered => {
                 log(
                     &format!("[APP_LINK] send delivered via tier-3 for {}", hexrep(dest, false)),
                     LOG_NOTICE, false, false,
                 );
             }
-            Ok(false) => {
+            OutcomeWait::Failed => {
                 log(
                     &format!("[APP_LINK] send tier-3: the stack reported delivery failed (receipt timed out or Resource failed) for {}", hexrep(dest, false)),
                     LOG_NOTICE, false, false,
                 );
                 Self::fire_failed_if_undelivered(&delivered, &on_failed);
             }
-            Err(_) => {
+            OutcomeWait::Quiet => {
                 log(
-                    &format!("[APP_LINK] send tier-3: no outcome from the stack within the backstop for {}", hexrep(dest, false)),
+                    &format!(
+                        "[APP_LINK] send tier-3: no outcome from the stack and no transfer activity for {} s (backstop) for {}",
+                        OUTCOME_BACKSTOP.as_secs(),
+                        hexrep(dest, false)
+                    ),
                     LOG_NOTICE, false, false,
                 );
                 Self::fire_failed_if_undelivered(&delivered, &on_failed);
+            }
+            OutcomeWait::Dropped => {
+                log(
+                    &format!("[APP_LINK] send tier-3: the stack dropped the transfer without an outcome for {}", hexrep(dest, false)),
+                    LOG_NOTICE, false, false,
+                );
+                Self::fire_failed_if_undelivered(&delivered, &on_failed);
+            }
+        }
+    }
+
+    /// The tier-3 outcome wait. Returns the stack's outcome for the transfer
+    /// as soon as it arrives. Fails it (`Quiet`) only once a full `backstop`
+    /// has passed since the later of the start of this wait and the last
+    /// transfer activity: a transfer that keeps moving is not stuck, and its
+    /// own RTT-scaled timeouts (packet receipt, Resource watchdog) decide it.
+    /// `Dropped` when every callback holding the channel was dropped without
+    /// reporting.
+    fn await_outcome(
+        outcome_rx: &std::sync::mpsc::Receiver<bool>,
+        activity: &TransferActivity,
+        backstop: Duration,
+    ) -> OutcomeWait {
+        use std::sync::mpsc::RecvTimeoutError;
+        let started = Instant::now();
+        let quiet_deadline = || activity.quiet_deadline(backstop).max(started + backstop);
+        loop {
+            let wait = quiet_deadline().saturating_duration_since(Instant::now());
+            match outcome_rx.recv_timeout(wait) {
+                Ok(true) => return OutcomeWait::Delivered,
+                Ok(false) => return OutcomeWait::Failed,
+                Err(RecvTimeoutError::Disconnected) => return OutcomeWait::Dropped,
+                Err(RecvTimeoutError::Timeout) => {
+                    if Instant::now() >= quiet_deadline() {
+                        return OutcomeWait::Quiet;
+                    }
+                }
             }
         }
     }
@@ -1965,10 +2085,13 @@ impl AppLinks {
         delivered: Arc<AtomicBool>,
         on_delivered: Arc<dyn Fn() + Send + Sync + 'static>,
         on_outcome_failed: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
+        watch: &TransferWatch,
     ) -> bool {
         if link_representation(packed.len()) == LinkRepresentation::Resource {
-            return Self::fire_resource_on_link(link, packed, compress, delivered, on_delivered, on_outcome_failed);
+            return Self::fire_resource_on_link(link, packed, compress, delivered, on_delivered, on_outcome_failed, watch);
         }
+        // One link packet: nothing to report until the proof (the reference
+        // sets a fixed 0.50 here, LXMF/LXMessage.py `send`).
         let Ok(dest) = link.build_link_destination() else {
             return false;
         };
@@ -2013,6 +2136,13 @@ impl AppLinks {
     /// every direct message left here as ONE link packet, so anything over
     /// the MDU never left the phone: the packet could not be built, the
     /// receipt timed out, and the 5-second fallback propagated it instead.
+    ///
+    /// The Resource's progress callback (RNS/Resource.py `request` →
+    /// `progress_callback`, LXMF/LXMessage.py `__as_resource`) reports its
+    /// fraction to the caller and marks transfer activity for Timer P and
+    /// the tier-3 backstop (`TransferWatch::resource_progress`). Until
+    /// 2026-09-29 it was `None`: the message sat at 5 % for the whole
+    /// transfer and the timers took a moving transfer for a stuck one.
     fn fire_resource_on_link(
         link: &LinkHandle,
         packed: &[u8],
@@ -2020,11 +2150,13 @@ impl AppLinks {
         delivered: Arc<AtomicBool>,
         on_delivered: Arc<dyn Fn() + Send + Sync + 'static>,
         on_outcome_failed: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
+        watch: &TransferWatch,
     ) -> bool {
         use reticulum_rust::resource::{AutoCompressOption, Resource, ResourceData, ResourceStatus};
         if !link.is_active() {
             return false;
         }
+        let progress = watch.resource_progress(delivered.clone());
         // The Resource's own RTT-scaled timeouts (RNS/Resource.py) decide the
         // outcome; concluded with any status but COMPLETE is the failure.
         let concluded: Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync> = Arc::new(move |resource| {
@@ -2047,7 +2179,7 @@ impl AppLinks {
             false,
             if compress { AutoCompressOption::Enabled } else { AutoCompressOption::Disabled },
             Some(concluded),
-            None,
+            Some(progress),
             None,
             1,
             None,
@@ -2106,12 +2238,121 @@ const LIVENESS_BUDGET: Duration = Duration::from_secs(5);
 /// Backstop on the tier-3 outcome wait. The outcome itself comes from the
 /// stack's own RTT-scaled timeouts (packet receipt, Resource); this only
 /// guards against a lost callback and is never what decides a send.
+/// It counts only time with neither an outcome nor transfer activity
+/// (`AppLinks::await_outcome`): each report of more of a Resource sent
+/// restarts it. Until 2026-09-29 it counted from the fire, and failed a
+/// ~4-minute Bluetooth photo transfer at 120 s while it was still moving.
 const OUTCOME_BACKSTOP: Duration = Duration::from_secs(120);
 
-/// How long to wait before firing `on_propagation_needed`.
-/// Matches §1's 5-second network-action limit.
+/// How long a send may go undelivered AND without transfer activity before
+/// Timer P fires `on_propagation_needed`: measured from the send, and again
+/// from each report of more of a Resource sent (`AppLinks::run_prop_timer`).
+/// Matches §1's 5-second network-action limit. Until 2026-09-29 it was
+/// measured from the send alone, so every transfer longer than 5 s got a
+/// propagated backup copy — the whole payload uploaded a second time.
 /// NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
 pub const PROP_FALLBACK_DELAY: Duration = LIVENESS_BUDGET;
+
+/// When one send's transfer last moved: the send's start, then each report
+/// from a Resource carrying it that more of it has been sent. Timer P and
+/// the tier-3 outcome backstop count from here, so they measure only time
+/// WITHOUT transfer activity — a transfer that is making progress is not
+/// stuck. Shared by every tier of the send.
+#[derive(Clone)]
+struct TransferActivity {
+    last: Arc<Mutex<Instant>>,
+}
+
+impl TransferActivity {
+    fn new() -> Self {
+        Self { last: Arc::new(Mutex::new(Instant::now())) }
+    }
+
+    /// The transfer moved: the quiet clocks start again from now.
+    fn mark(&self) {
+        let mut last = self.last.lock().unwrap_or_else(|p| p.into_inner());
+        *last = Instant::now();
+    }
+
+    /// The moment `window` without transfer activity will have passed.
+    fn quiet_deadline(&self, window: Duration) -> Instant {
+        *self.last.lock().unwrap_or_else(|p| p.into_inner()) + window
+    }
+}
+
+/// What the Resources carrying one send report to: the caller's progress
+/// callback and the send's activity clock.
+#[derive(Clone)]
+struct TransferWatch {
+    activity: TransferActivity,
+    on_progress: Option<SendProgressCallback>,
+}
+
+impl TransferWatch {
+    fn new(on_progress: Option<SendProgressCallback>) -> Self {
+        Self { activity: TransferActivity::new(), on_progress }
+    }
+
+    /// The reporter for one Resource: called with the fraction
+    /// `Resource::get_progress` gives after each request the receiver makes.
+    /// Until the send is delivered it hands the caller that raw fraction,
+    /// and marks transfer activity when this Resource's fraction has grown
+    /// (a request that only brings resends is not progress). After delivery
+    /// it does nothing.
+    fn reporter(&self, delivered: Arc<AtomicBool>) -> impl Fn(f64) + Send + Sync + 'static {
+        let watch = self.clone();
+        let reached = Mutex::new(0.0f64);
+        move |fraction: f64| {
+            if delivered.load(Ordering::Acquire) {
+                return;
+            }
+            let advanced = {
+                let mut reached = reached.lock().unwrap_or_else(|p| p.into_inner());
+                let advanced = fraction > *reached;
+                if advanced {
+                    *reached = fraction;
+                }
+                advanced
+            };
+            if advanced {
+                watch.activity.mark();
+            }
+            if let Some(on_progress) = &watch.on_progress {
+                on_progress(fraction);
+            }
+        }
+    }
+
+    /// The `progress_callback` for one Resource carrying the send
+    /// (RNS/Resource.py hands the Resource to it after each request it
+    /// serves): reads the fraction and passes it to [`Self::reporter`].
+    fn resource_progress(
+        &self,
+        delivered: Arc<AtomicBool>,
+    ) -> Arc<dyn Fn(Arc<Mutex<reticulum_rust::resource::Resource>>) + Send + Sync> {
+        let report = self.reporter(delivered);
+        Arc::new(move |resource| {
+            let fraction = resource.lock().map(|mut r| r.get_progress());
+            if let Ok(fraction) = fraction {
+                report(fraction);
+            }
+        })
+    }
+}
+
+/// How the tier-3 outcome wait ended (`AppLinks::await_outcome`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutcomeWait {
+    /// The delivery proof, or the Resource concluded COMPLETE.
+    Delivered,
+    /// The stack's failure event: receipt timeout, or the Resource concluded
+    /// without COMPLETE.
+    Failed,
+    /// The backstop passed with no outcome and no transfer activity.
+    Quiet,
+    /// Every callback that could report was dropped without reporting.
+    Dropped,
+}
 
 /// Polling interval while waiting for a path to populate after firing
 /// `request_path`.  20 ms keeps wake-up cost negligible.
@@ -2311,7 +2552,8 @@ impl AppLinks {
 // ─── Tests ────────────────────────────────────────────────────────────────
 //
 // These tests verify the orchestration constraints described in the send spec:
-//   §O1 Timer P fires on_propagation_needed after PROP_FALLBACK_DELAY.
+//   §O1 Timer P fires on_propagation_needed after PROP_FALLBACK_DELAY
+//       without transfer activity.
 //   §O2 Timer P does NOT fire if delivery happened before the delay.
 //   §O3 The delivered gate fires on_delivered exactly once even when
 //       multiple tiers fire concurrently.
@@ -2319,6 +2561,10 @@ impl AppLinks {
 //       on the same send (propagation starts while tier-3 still runs).
 //   §O5 Tier advancement does not cancel prior in-flight tier packets
 //       (the delivered gate remains settable from any tier at any time).
+//   §O6 A Resource's progress reaches the caller until delivery, and marks
+//       transfer activity when more of it has been sent.
+//   §O7 A transfer that keeps moving gets no Timer P backup and is not
+//       failed by the tier-3 backstop; a silent one gets both.
 //
 // All tests use short delays (ms) so the suite completes quickly.
 
@@ -2342,18 +2588,76 @@ mod tests {
         }
     }
 
-    /// Spawn a Timer P with a custom delay for test speed.
+    /// Spawn a Timer P with a custom delay for test speed, on production's
+    /// clock (`run_prop_timer`), with no transfer activity.
     fn spawn_prop_timer(
         delay: Duration,
         delivered: Arc<AtomicBool>,
         on_prop: Arc<dyn Fn() + Send + Sync + 'static>,
     ) {
+        spawn_prop_timer_watching(delay, delivered, TransferActivity::new(), on_prop);
+    }
+
+    /// Timer P on production's clock, watching `activity`. The handle
+    /// yields whether it fired.
+    fn spawn_prop_timer_watching(
+        delay: Duration,
+        delivered: Arc<AtomicBool>,
+        activity: TransferActivity,
+        on_prop: Arc<dyn Fn() + Send + Sync + 'static>,
+    ) -> std::thread::JoinHandle<bool> {
+        std::thread::spawn(move || AppLinks::run_prop_timer(delay, &delivered, &activity, || on_prop()))
+    }
+
+    /// The tier-3 outcome wait on production's code, on its own thread. The
+    /// handle yields how it ended and when.
+    fn spawn_outcome_wait(
+        rx: mpsc::Receiver<bool>,
+        activity: TransferActivity,
+        backstop: Duration,
+    ) -> std::thread::JoinHandle<(OutcomeWait, Instant)> {
         std::thread::spawn(move || {
-            std::thread::sleep(delay);
-            if !delivered.load(Ordering::Acquire) {
-                on_prop();
-            }
-        });
+            let outcome = AppLinks::await_outcome(&rx, &activity, backstop);
+            (outcome, Instant::now())
+        })
+    }
+
+    /// A sending Resource with `total_parts` parts on a bare link, carrying
+    /// `progress` as its progress callback. Its data is never built (that
+    /// needs an established link); `request` below serves requests on it the
+    /// way the stack does and calls the callback the way the stack does.
+    fn sending_resource(
+        total_parts: usize,
+        progress: Arc<dyn Fn(Arc<Mutex<reticulum_rust::resource::Resource>>) + Send + Sync>,
+    ) -> reticulum_rust::resource::Resource {
+        use reticulum_rust::destination::Destination;
+        use reticulum_rust::resource::{AutoCompressOption, Resource, ResourceLinkContext};
+        let link = LinkHandle::spawn(Link::new_inbound(Destination::default()).expect("test link"));
+        let ctx = ResourceLinkContext {
+            mtu: 500,
+            rtt: Some(0.1),
+            traffic_timeout_factor: 4.0,
+            establishment_cost: 0,
+            last_resource_window: None,
+            last_resource_eifr: None,
+        };
+        let mut resource = Resource::new_internal(
+            None, link, None, false, AutoCompressOption::Disabled,
+            None, Some(progress), Some(0.0), 0, None, None, false, 0, Some(&ctx),
+        )
+        .expect("test resource");
+        resource.initiator = true;
+        resource.total_parts = total_parts;
+        resource
+    }
+
+    /// The receiver asks for more and `sent` parts have now gone out:
+    /// `Resource::request` serves the REQ and calls the progress callback.
+    fn serve_request(resource: &mut reticulum_rust::resource::Resource, sent: usize) {
+        resource.sent_parts = sent;
+        let mut req = vec![0x00u8];
+        req.extend_from_slice(&[0u8; 32]);
+        resource.request(&req);
     }
 
     /// close_all drops every registration and tells the host so. The
@@ -2406,12 +2710,14 @@ mod tests {
         let dest: Vec<u8> = (0u8..16).map(|i| i.wrapping_mul(13)).collect();
         let fired = Arc::new(AtomicBool::new(false));
         let (f1, f2) = (fired.clone(), fired.clone());
+        let f3 = fired.clone();
         let result = AppLinks::send_on_held_link(
             &dest,
             vec![1, 2, 3],
             true,
             Arc::new(move || f1.store(true, Ordering::Release)),
             Arc::new(move || f2.store(true, Ordering::Release)),
+            Some(Arc::new(move |_| f3.store(true, Ordering::Release))),
         );
         assert!(result.is_err());
         assert!(!fired.load(Ordering::Acquire), "no callback without a send");
@@ -3009,5 +3315,208 @@ mod tests {
                 && verified_wait < verified_check,
             "path races must not immediately accept cached paths before issuing a fresh path request"
         );
+    }
+
+    // §O6 — the Resource's own progress reaches the caller, raw, through
+    // the stack's request path, and stops at delivery.
+    #[test]
+    fn a_resource_reports_its_progress_to_the_caller_until_delivery() {
+        let seen: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_cb = seen.clone();
+        let watch = TransferWatch::new(Some(Arc::new(move |fraction| {
+            seen_cb.lock().unwrap().push(fraction);
+        })));
+        let delivered = Arc::new(AtomicBool::new(false));
+        let mut resource = sending_resource(4, watch.resource_progress(delivered.clone()));
+
+        serve_request(&mut resource, 1);
+        serve_request(&mut resource, 2);
+        serve_request(&mut resource, 3);
+        assert_eq!(*seen.lock().unwrap(), vec![0.25, 0.5, 0.75], "the raw Resource fraction, per request served");
+
+        delivered.store(true, Ordering::Release);
+        serve_request(&mut resource, 4);
+        assert_eq!(seen.lock().unwrap().len(), 3, "nothing is reported after delivery");
+    }
+
+    // §O6 — only more of the message sent is activity: a request that
+    // brings only resends leaves the fraction where it was.
+    #[test]
+    fn only_more_of_the_transfer_sent_is_activity() {
+        let watch = TransferWatch::new(None);
+        let delivered = Arc::new(AtomicBool::new(false));
+        let report = watch.reporter(delivered.clone());
+        let at = |w: &TransferWatch| w.activity.quiet_deadline(Duration::ZERO);
+
+        let start = at(&watch);
+        std::thread::sleep(Duration::from_millis(5));
+        report(0.5);
+        let moved = at(&watch);
+        assert!(moved > start, "more of the transfer sent restarts the quiet clock");
+
+        std::thread::sleep(Duration::from_millis(5));
+        report(0.5);
+        report(0.25);
+        assert_eq!(at(&watch), moved, "a resend-only request, or a lower fraction, is not activity");
+
+        delivered.store(true, Ordering::Release);
+        std::thread::sleep(Duration::from_millis(5));
+        report(0.9);
+        assert_eq!(at(&watch), moved, "nothing counts after delivery");
+    }
+
+    /// Feed `report` a rising fraction every `every` for `steps` steps.
+    fn feed_progress(report: impl Fn(f64), steps: usize, every: Duration) {
+        for step in 1..=steps {
+            std::thread::sleep(every);
+            report(step as f64 / (steps as f64 + 1.0));
+        }
+    }
+
+    // §O7 — a transfer that keeps moving outlasts both Timer P's delay and
+    // the tier-3 backstop several times over: no backup copy, no failure,
+    // and delivery ends both.
+    #[test]
+    fn a_moving_transfer_gets_no_backup_and_is_not_failed_at_the_backstop() {
+        let delay = Duration::from_millis(150);
+        let backstop = Duration::from_millis(200);
+        let watch = TransferWatch::new(None);
+        let delivered = Arc::new(AtomicBool::new(false));
+        let prop = Arc::new(AtomicBool::new(false));
+        let prop_cb = prop.clone();
+        let timer = spawn_prop_timer_watching(
+            delay,
+            delivered.clone(),
+            watch.activity.clone(),
+            Arc::new(move || prop_cb.store(true, Ordering::Release)),
+        );
+        let (tx, rx) = mpsc::sync_channel::<bool>(2);
+        let wait = spawn_outcome_wait(rx, watch.activity.clone(), backstop);
+
+        let started = Instant::now();
+        feed_progress(watch.reporter(delivered.clone()), 60, Duration::from_millis(10));
+        assert!(started.elapsed() > backstop * 2, "the transfer ran past both clocks");
+        assert!(!prop.load(Ordering::Acquire), "no propagated backup while the transfer moves");
+
+        // The Resource concludes COMPLETE: the delivered gate, then the outcome.
+        delivered.store(true, Ordering::Release);
+        tx.send(true).unwrap();
+        let (outcome, _) = wait.join().unwrap();
+        assert_eq!(outcome, OutcomeWait::Delivered, "the backstop must not fail a moving transfer");
+        assert!(!timer.join().unwrap(), "Timer P never fires after delivery");
+        assert!(!prop.load(Ordering::Acquire));
+    }
+
+    // §O7 — a silent transfer: Timer P fires after its delay, and the
+    // backstop fails it after a full backstop from the start of the wait.
+    #[test]
+    fn a_silent_transfer_gets_the_backup_and_fails_at_the_backstop() {
+        let delay = Duration::from_millis(60);
+        let backstop = Duration::from_millis(120);
+        let watch = TransferWatch::new(None);
+        let delivered = Arc::new(AtomicBool::new(false));
+        let (prop_tx, prop_rx) = mpsc::channel::<Instant>();
+        let started = Instant::now();
+        let timer = spawn_prop_timer_watching(
+            delay,
+            delivered.clone(),
+            watch.activity.clone(),
+            Arc::new(move || { let _ = prop_tx.send(Instant::now()); }),
+        );
+        let (_tx, rx) = mpsc::sync_channel::<bool>(2);
+        let (outcome, ended) = spawn_outcome_wait(rx, watch.activity.clone(), backstop).join().unwrap();
+
+        assert_eq!(outcome, OutcomeWait::Quiet);
+        assert!(ended.duration_since(started) >= backstop, "never before a full backstop");
+        let fired_at = prop_rx.recv_timeout(Duration::from_secs(2)).expect("Timer P fires");
+        assert!(fired_at.duration_since(started) >= delay, "never before its delay");
+        assert!(timer.join().unwrap());
+    }
+
+    // §O7 — the quiet clocks run from the LAST activity: a transfer that
+    // stops moving gets the backup a delay later and fails a backstop later.
+    #[test]
+    fn a_transfer_that_stops_moving_is_failed_a_backstop_after_its_last_progress() {
+        let delay = Duration::from_millis(100);
+        let backstop = Duration::from_millis(150);
+        let watch = TransferWatch::new(None);
+        let delivered = Arc::new(AtomicBool::new(false));
+        let (prop_tx, prop_rx) = mpsc::channel::<Instant>();
+        let timer = spawn_prop_timer_watching(
+            delay,
+            delivered.clone(),
+            watch.activity.clone(),
+            Arc::new(move || { let _ = prop_tx.send(Instant::now()); }),
+        );
+        let (_tx, rx) = mpsc::sync_channel::<bool>(2);
+        let wait = spawn_outcome_wait(rx, watch.activity.clone(), backstop);
+
+        feed_progress(watch.reporter(delivered.clone()), 30, Duration::from_millis(10));
+        let last = watch.activity.quiet_deadline(Duration::ZERO);
+
+        let (outcome, ended) = wait.join().unwrap();
+        assert_eq!(outcome, OutcomeWait::Quiet, "stuck after it stopped moving");
+        assert!(ended.duration_since(last) >= backstop, "a full backstop after the last progress");
+        let fired_at = prop_rx.recv_timeout(Duration::from_secs(2)).expect("Timer P fires once it stops moving");
+        assert!(fired_at.duration_since(last) >= delay, "a full delay after the last progress");
+        assert!(timer.join().unwrap());
+    }
+
+    // The stack's own outcome ends the wait at once, whatever the clocks say.
+    #[test]
+    fn the_stacks_outcome_ends_the_outcome_wait_at_once() {
+        let backstop = Duration::from_secs(60);
+        let (tx, rx) = mpsc::sync_channel::<bool>(2);
+        tx.send(false).unwrap();
+        assert_eq!(AppLinks::await_outcome(&rx, &TransferActivity::new(), backstop), OutcomeWait::Failed);
+        tx.send(true).unwrap();
+        assert_eq!(AppLinks::await_outcome(&rx, &TransferActivity::new(), backstop), OutcomeWait::Delivered);
+        drop(tx);
+        let started = Instant::now();
+        assert_eq!(AppLinks::await_outcome(&rx, &TransferActivity::new(), backstop), OutcomeWait::Dropped);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    // The production send path is wired to all of the above: every Resource
+    // it builds carries the progress callback, every tier shares one watch,
+    // and Timer P and the tier-3 wait read its activity clock.
+    #[test]
+    fn the_send_path_reports_progress_and_counts_only_quiet_time() {
+        let src = include_str!("lib.rs");
+        let production = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source prefix must exist");
+        let between = |from: &str, to: &str| -> String {
+            let start = production.find(from).unwrap_or_else(|| panic!("{} must exist", from));
+            let tail = &production[start..];
+            let end = tail.find(to).unwrap_or_else(|| panic!("{} must follow {}", to, from));
+            tail[..end].to_string()
+        };
+
+        let resource = between("fn fire_resource_on_link(", "\n    }\n}");
+        assert!(resource.contains("let progress = watch.resource_progress(delivered.clone());"));
+        assert!(
+            resource.contains("Some(concluded),\n            Some(progress),"),
+            "the delivery Resource's progress_callback (after `callback`) must be the watch's, not None"
+        );
+
+        let chain = between("fn run_tier_chain(", "fn run_prop_timer(");
+        assert!(chain.contains("let watch = TransferWatch::new(on_progress);"));
+        assert!(chain.contains("Self::run_prop_timer(prop_delay, &delivered_p, &activity_p, ||"));
+        assert!(chain.contains("let activity_p = watch.activity.clone();"));
+        assert_eq!(chain.matches("&watch,\n").count(), 3, "tiers 1, 2 and 3 share the watch");
+        assert!(!chain.contains("spawn_after("), "Timer P is not a fixed-delay one-shot");
+
+        let tier3 = between("fn run_tier3(", "fn await_outcome(");
+        assert!(tier3.contains("Self::await_outcome(&outcome_rx, &watch.activity, OUTCOME_BACKSTOP)"));
+        assert!(!tier3.contains("recv_timeout(OUTCOME_BACKSTOP)"), "the backstop counts quiet time only");
+
+        let held = between("pub fn send_on_held_link(", "pub fn status(");
+        assert!(held.contains("let watch = TransferWatch::new(on_progress);"));
+        assert!(held.contains("Some(on_failed), &watch)"));
+
+        let send = between("pub fn send_with_compression(", "pub fn send_with_spec(");
+        assert!(send.contains("on_progress,\n                );"), "the caller's callback reaches the tier chain");
     }
 }
