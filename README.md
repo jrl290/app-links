@@ -47,9 +47,10 @@ For direct LXMF delivery, AppLinks acts as a send orchestrator.
 		failure event. That means the Resource concluding without COMPLETE,
 		which is also how it ends when its link closes or when the receiver
 		never answers its advertisement (RNS 1.5.2 `Resource.py`: the watchdog
-		gives up after `MAX_ADV_RETRIES`). No clock hands a tier over. A
-		Resource queued behind another transfer on its link waits its turn, as
-		the reference does.
+		gives up after `MAX_ADV_RETRIES`). No clock hands a tier over: not the
+		stagger, and not the outcome backstop below. A Resource queued behind
+		another transfer on its link waits its turn, as the reference does. A
+		stalled one is decided by its own RTT-scaled timeouts.
 	- Since 2026-09-29. Before that, Resource tiers staggered by 1 s like
 		packets, so a photo went out two or three times at once. On the iPad over
 		the Bluetooth RTNode link it ran as two concurrent 3700-part Resources,
@@ -59,7 +60,11 @@ For direct LXMF delivery, AppLinks acts as a send orchestrator.
 - A send has one outcome. `on_delivered` fires once, from whichever tier
 	delivers first. `on_failed` fires once, only when no tier is left to fire
 	and every tier that fired has failed (or no tier could fire). Anything a
-	tier reports after the outcome is logged and ignored.
+	tier reports after the outcome is logged and ignored, except a delivery
+	after `on_failed`. That still reaches `on_delivered`, once, because the
+	peer proved it holds the message. It is the same rule Reticulum-rust
+	follows for a late proof (PARITY-AUDIT B35), and LXMF reports it as a late
+	delivery.
 - It tracks inbound delivery links opened by peers so later sends can reuse
 	them as the first tier.
 - It owns the 5-second propagation fallback trigger (Timer P) used when direct
@@ -69,8 +74,16 @@ For direct LXMF delivery, AppLinks acts as a send orchestrator.
 	so a transfer that is moving gets no propagated backup copy. The activity
 	clock is shared across the tiers, so a Resource that fails on one tier and
 	moves on the next is one transfer to Timer P. Each fired tier's outcome
-	backstop (120 s) counts the same way. It only guards a lost callback and
-	never hands over a moving transfer.
+	backstop (120 s) counts the same way. It only guards a lost callback. On
+	a packet tier it counts the tier failed. On a Resource tier it only logs:
+	a Resource that has not concluded can still deliver, so its own events
+	decide it.
+- Earlier on 2026-09-29 the backstop still failed a quiet Resource tier and
+	handed it over. A photo queued for 120 s behind another photo on its link
+	went out again on the next tier, beside the first, and the queued copy
+	went too once its turn came. That change also swallowed a delivery that
+	came after `on_failed`, so a message the peer had proved stayed FAILED.
+	Both were fixed the same evening.
 - It reports a Resource transfer's progress to the caller
 	(`send_with_compression` / `send_on_held_link`, `SendProgressCallback`):
 	the raw `Resource::get_progress` fraction after each request served, until

@@ -94,8 +94,10 @@
 //!     Resource ends when its link closes (RNS/Link.py `link_closed` cancels
 //!     it) and when the receiver never starts the transfer (RNS/Resource.py
 //!     watchdog: the advertisement unanswered through `MAX_ADV_RETRIES`).
-//!     Never because a clock ran.  A Resource QUEUED behind another transfer
-//!     on its link waits its turn, as the reference does.
+//!     Never because a clock ran: not the stagger, and not the outcome
+//!     backstop below.  A Resource QUEUED behind another transfer on its link
+//!     waits its turn, as the reference does, and a stalled one is decided
+//!     by its own RTT-scaled timeouts.
 //!
 //! Until 2026-09-29 every tier fired 1 s after the one before whatever the
 //! payload, so a Resource went out two or three times at once: an iPad
@@ -107,10 +109,20 @@
 //! One outcome per send (`SendOutcome`): `on_delivered` once, from whichever
 //! tier delivers first; `on_failed` once, only when the chain will fire no
 //! more tiers and every tier that fired has failed (or no tier could fire).
-//! Anything a tier reports after the outcome is logged and ignored.  Each
-//! fired tier's outcome wait has the 120 s backstop, which counts only time
-//! with neither an outcome nor transfer activity: it guards a lost callback
-//! and never decides a moving transfer.
+//! Anything a tier reports after the outcome is logged and ignored, except
+//! a delivery after `on_failed`.  That still reaches `on_delivered`, once:
+//! the peer proved it holds the message (Reticulum-rust's PARITY-AUDIT B35
+//! rule for a late proof).  Each fired tier's outcome wait has the 120 s
+//! backstop, which counts only time with neither an outcome nor transfer
+//! activity.  It guards a lost callback.  On a packet tier it counts the tier
+//! failed.  On a Resource tier it only logs, because a Resource that has not
+//! concluded can still deliver.
+//!
+//! Earlier on 2026-09-29 the backstop still failed a quiet Resource tier and
+//! handed it over.  A photo queued for 120 s behind another photo on its link
+//! went out again on the next tier, beside the first, and the queued copy
+//! went too once its turn came.  That change also swallowed a delivery that
+//! came after `on_failed`, so a message the peer had proved stayed FAILED.
 //!
 //! `send_with_compression` and `send_on_held_link` take an optional progress
 //! callback that hears the Resource's own fraction (`Resource::get_progress`,
@@ -166,9 +178,10 @@ pub const APP_LINK_DISCONNECTED: u8 = 0x04;
 /// the next tier fires only on the earlier tier's own failure event (its
 /// Resource concluding FAILED: rejected, the link closed, the advertisement
 /// unanswered through its retries, a part or proof timed out), never because
-/// this second passed.  Until 2026-09-29 every tier fired its own full
-/// Resource 1 s after the one before, so a photo went out two or three times
-/// at once and each copy ran at a fraction of the link's speed.
+/// this second passed, and never at the outcome backstop either.  Until
+/// 2026-09-29 every tier fired its own full Resource 1 s after the one
+/// before, so a photo went out two or three times at once and each copy ran
+/// at a fraction of the link's speed.
 ///
 /// Owned here because AppLinks drives all tier scheduling.
 pub const DIRECT_STAGGER_WAIT: f64 = 1.0;
@@ -1524,13 +1537,16 @@ impl AppLinks {
     // A message over the link MDU travels as a Resource, and a tier hands
     // over to the next only on its OWN failure event (its Resource
     // concluding without COMPLETE: failed, rejected, its link closed, its
-    // advertisement unanswered through MAX_ADV_RETRIES), never on a clock.
+    // advertisement unanswered through MAX_ADV_RETRIES), never on a clock:
+    // not the stagger, and not the outcome backstop, which only logs on a
+    // Resource tier.
     // Until 2026-09-29 the Resource tiers staggered by 1 s like packets, and
     // a photo went out as two or three concurrent full Resources.
     //
     // One SendOutcome decides the send: on_delivered once, from the first
     // tier to deliver; on_failed once, when the chain fires no more tiers and
-    // every tier that fired has failed (or none could fire). A parallel
+    // every tier that fired has failed (or none could fire). A delivery
+    // after on_failed (a late proof) still reaches on_delivered. A parallel
     // Timer P fires on_propagation_needed once the send has gone 5 s
     // undelivered with no transfer activity on any tier (a Resource
     // reporting more of the message sent restarts the 5 s).
@@ -1554,10 +1570,12 @@ impl AppLinks {
     ///                              receipt timeout, Resource concluded
     ///                              without COMPLETE) and no tier is left to
     ///                              fire, or when no tier could fire at all.
-    ///                              A fired tier that goes the 120 s outcome
-    ///                              backstop with neither an outcome nor
-    ///                              transfer activity counts as failed.
+    ///                              A fired packet tier that goes the 120 s
+    ///                              outcome backstop with no outcome counts
+    ///                              as failed; a Resource tier never does.
     ///                              Never while a fired tier is in flight.
+    ///                              A delivery after it still calls
+    ///                              `on_delivered`, once (a late proof).
     pub fn send(
         dest: &[u8],
         packed: Vec<u8>,
@@ -1742,7 +1760,7 @@ impl AppLinks {
             if resource {
                 // The Resource runs to its own outcome. Tier 2 fires only if
                 // it fails; a moving transfer gets no second copy.
-                if Self::await_tier(outcome, Tier::Inbound, &tier1_rx, &watch, pacing.backstop) {
+                if Self::await_tier(outcome, Tier::Inbound, &tier1_rx, &watch, pacing.backstop, representation) {
                     return;
                 }
             } else {
@@ -1770,7 +1788,7 @@ impl AppLinks {
         if tier2_fired {
             if resource {
                 // As tier 1: tier 3 fires only if this Resource fails.
-                if Self::await_tier(outcome, Tier::Cached, &tier2_rx, &watch, pacing.backstop) {
+                if Self::await_tier(outcome, Tier::Cached, &tier2_rx, &watch, pacing.backstop, representation) {
                     return;
                 }
             } else {
@@ -1805,13 +1823,13 @@ impl AppLinks {
         // has already failed or none could fire.
         outcome.exhausted();
         if tier3_fired {
-            Self::await_tier(outcome, Tier::NewLink, &tier3_rx, &watch, pacing.backstop);
+            Self::await_tier(outcome, Tier::NewLink, &tier3_rx, &watch, pacing.backstop, representation);
         }
         for (tier, rx) in unheard {
             if outcome.is_decided() {
                 break;
             }
-            Self::await_tier(outcome, tier, &rx, &watch, pacing.backstop);
+            Self::await_tier(outcome, tier, &rx, &watch, pacing.backstop, representation);
         }
     }
 
@@ -2083,14 +2101,27 @@ impl AppLinks {
     /// already heard it from the tier's own callbacks.
     ///
     /// The backstop only guards a lost callback: it counts time with neither
-    /// an outcome nor transfer activity (`await_outcome`), and a tier that
-    /// goes the whole backstop that way, or whose callbacks were all dropped
-    /// unheard, is counted as failed here. Until 2026-09-23 tier 3 waited a
-    /// fixed LIVENESS_BUDGET (5 s) after its link came up and then declared
-    /// failure while a transfer was still in flight: on a 3 s RTT link a
-    /// Resource cannot finish in 5 s, so every direct message over the MDU
-    /// "failed" and went to propagation. The 5-second promise to the user is
-    /// Timer P (propagation fallback), not this wait. Until 2026-09-29 the
+    /// an outcome nor transfer activity (`await_outcome`). A tier whose
+    /// callbacks were all dropped unheard is counted as failed here. So is a
+    /// packet tier that goes the whole backstop with no outcome: its receipt
+    /// callback never came. A Resource tier is not. The backstop passing only
+    /// logs, and the wait goes on for the Resource's own outcome. A Resource
+    /// that has not concluded can still deliver: it may be QUEUED behind
+    /// another transfer on its link (RNS 1.5.2 Resource.py waits there with
+    /// no clock), or stalled inside its own give-up time (RTT × 4 × 16 + 78 s,
+    /// past 120 s once the RTT is over 0.66 s). Its own watchdog, its link
+    /// closing, or its being dropped unconcluded ends it. Handing it over
+    /// here would put a second full copy on the air beside it. Until
+    /// 2026-09-29 (evening) the backstop failed a Resource tier: a photo
+    /// queued behind another photo for 120 s went out again on the next
+    /// tier, and the queued copy went too once its turn came.
+    ///
+    /// Until 2026-09-23 tier 3 waited a fixed LIVENESS_BUDGET (5 s) after its
+    /// link came up and then declared failure while a transfer was still in
+    /// flight: on a 3 s RTT link a Resource cannot finish in 5 s, so every
+    /// direct message over the MDU "failed" and went to propagation. The
+    /// 5-second promise to the user is Timer P (propagation fallback), not
+    /// this wait. Until 2026-09-29 the
     /// OUTCOME_BACKSTOP was the same mistake on a longer clock: 120 s after
     /// the fire it failed a Resource that was still moving (an iPad photo,
     /// ~4 minutes over Bluetooth, reported FAILED at 120 s and DELIVERED
@@ -2103,20 +2134,34 @@ impl AppLinks {
         rx: &std::sync::mpsc::Receiver<bool>,
         watch: &TransferWatch,
         backstop: Duration,
+        representation: LinkRepresentation,
     ) -> bool {
-        match Self::await_outcome(rx, &watch.activity, backstop) {
-            OutcomeWait::Delivered => true,
-            OutcomeWait::Failed => false,
-            OutcomeWait::Quiet => {
-                outcome.tier_failed(
-                    tier,
-                    &format!("no outcome from the stack and no transfer activity for {:?} (backstop)", backstop),
-                );
-                false
-            }
-            OutcomeWait::Dropped => {
-                outcome.tier_failed(tier, "the stack dropped the transfer without an outcome");
-                false
+        loop {
+            match Self::await_outcome(rx, &watch.activity, backstop) {
+                OutcomeWait::Delivered => return true,
+                OutcomeWait::Failed => return false,
+                OutcomeWait::Quiet if representation == LinkRepresentation::Resource => {
+                    log(
+                        &format!(
+                            "[APP_LINK] send tier-{}: no outcome and no transfer activity for {:?} for {}; its Resource has not concluded (queued behind another transfer on its link, or inside its own timeouts), so the tier stays in flight until it does",
+                            tier.number(),
+                            backstop,
+                            hexrep(&outcome.dest, false)
+                        ),
+                        LOG_NOTICE, false, false,
+                    );
+                }
+                OutcomeWait::Quiet => {
+                    outcome.tier_failed(
+                        tier,
+                        &format!("no outcome from the stack and no transfer activity for {:?} (backstop)", backstop),
+                    );
+                    return false;
+                }
+                OutcomeWait::Dropped => {
+                    outcome.tier_failed(tier, "the stack dropped the transfer without an outcome");
+                    return false;
+                }
             }
         }
     }
@@ -2338,12 +2383,18 @@ const LIVENESS_BUDGET: Duration = Duration::from_secs(5);
 /// Backstop on each fired tier's outcome wait (`AppLinks::await_tier`; until
 /// 2026-09-29 only tier 3 had one). The outcome itself comes from the
 /// stack's own RTT-scaled timeouts (packet receipt, Resource); this only
-/// guards against a lost callback and is never what decides a send or hands
-/// a tier over while its transfer moves. It counts only time with neither an
+/// guards against a lost callback. It counts only time with neither an
 /// outcome nor transfer activity (`AppLinks::await_outcome`): each report of
-/// more of a Resource sent restarts it. Until 2026-09-29 it counted from the
-/// fire, and failed a ~4-minute Bluetooth photo transfer at 120 s while it
-/// was still moving.
+/// more of a Resource sent restarts it. On a packet tier it counts the tier
+/// failed, because the receipt callback never came. On a Resource tier it
+/// only logs. The Resource's own events decide that tier, since a Resource
+/// that has not concluded can still deliver. It may be queued behind
+/// another transfer on its link, or stalled within its own give-up time,
+/// which passes 120 s once the RTT is over 0.66 s. So the backstop never
+/// hands a Resource tier over and never fails one. Until 2026-09-29 it
+/// counted from the fire, and failed a ~4-minute Bluetooth photo transfer at
+/// 120 s while it was still moving. Until that evening it still failed a
+/// quiet Resource tier, so a photo queued behind another went out twice.
 const OUTCOME_BACKSTOP: Duration = Duration::from_secs(120);
 
 /// How long a send may go undelivered AND without transfer activity before
@@ -2498,7 +2549,8 @@ struct ChainPacing {
     /// destination is already DISCONNECTED).
     prop_delay: Duration,
     /// The lost-callback guard on each fired tier's outcome wait
-    /// ([`OUTCOME_BACKSTOP`]; quiet time only).
+    /// ([`OUTCOME_BACKSTOP`]; quiet time only). It fails a packet tier; on a
+    /// Resource tier it only logs.
     backstop: Duration,
 }
 
@@ -2597,8 +2649,9 @@ impl TierLinks for StackTiers<'_> {
 /// fired has failed — or no tier could fire. So neither a tier-3 setup
 /// failure nor a later tier's failure can fail a send whose earlier tier is
 /// still in flight. Whatever a tier reports after the outcome is logged and
-/// ignored. Until 2026-09-29 tiers 1 and 2 reported no failure at all and
-/// tier 3 alone decided `on_failed`.
+/// ignored, except a delivery after `on_failed`: that still reaches
+/// `on_delivered`, once ([`Self::tier_delivered`]). Until 2026-09-29 tiers 1
+/// and 2 reported no failure at all and tier 3 alone decided `on_failed`.
 struct SendOutcome {
     dest: Vec<u8>,
     /// The send's delivered gate: Timer P and the chain read it.
@@ -2721,39 +2774,55 @@ impl SendOutcome {
         self.state().decided.is_some()
     }
 
-    /// `tier` delivered: the send is delivered, unless it already had its
-    /// outcome.
+    /// `tier` delivered: the send is delivered, unless it already was.
+    ///
+    /// A delivery after the send FAILED still reaches `on_delivered`, once.
+    /// The peer has proved it holds the message, and telling the user it
+    /// failed while holding that proof is wrong. This is the same rule as
+    /// Reticulum-rust's `PacketReceipt::mark_delivered` (PARITY-AUDIT B35: a
+    /// late proof delivers a receipt that timed out), and LXMF reports it as a
+    /// late delivery (`report_late_delivery`). Delivery may follow a failure,
+    /// never the reverse. Until 2026-09-29 (evening) this ignored it, so a
+    /// message the peer had proved stayed FAILED.
     fn tier_delivered(&self, tier: Tier) {
-        let first = {
+        let after_failure = {
             let mut state = self.state();
             state.in_flight[tier.index()] = false;
             match state.decided {
-                None => {
-                    state.decided = Some(true);
-                    true
-                }
-                Some(earlier) => {
+                Some(true) => {
                     log(
                         &format!(
-                            "[APP_LINK] send tier-{} delivered after the send had already {} for {}; ignored",
+                            "[APP_LINK] send tier-{} delivered after the send had already been delivered for {}; ignored",
                             tier.number(),
-                            outcome_word(earlier),
                             hexrep(&self.dest, false)
                         ),
                         LOG_NOTICE, false, false,
                     );
-                    false
+                    return;
+                }
+                earlier => {
+                    state.decided = Some(true);
+                    earlier == Some(false)
                 }
             }
         };
-        if first {
-            self.delivered.store(true, Ordering::Release);
+        self.delivered.store(true, Ordering::Release);
+        if after_failure {
+            log(
+                &format!(
+                    "[APP_LINK] send tier-{} delivered for {} after the send had failed; reporting the late delivery",
+                    tier.number(),
+                    hexrep(&self.dest, false)
+                ),
+                LOG_NOTICE, false, false,
+            );
+        } else {
             log(
                 &format!("[APP_LINK] send delivered via tier-{} for {}", tier.number(), hexrep(&self.dest, false)),
                 LOG_NOTICE, false, false,
             );
-            (self.on_delivered)();
         }
+        (self.on_delivered)();
     }
 
     /// `tier`'s own failure event (or its outcome wait's backstop). Fails the
@@ -3017,17 +3086,20 @@ impl AppLinks {
 //       (the delivered gate remains settable from any tier at any time).
 //   §O6 A Resource's progress reaches the caller until delivery, and marks
 //       transfer activity when more of it has been sent.
-//   §O7 A transfer that keeps moving gets no Timer P backup and is not
-//       failed by the outcome backstop; a silent one gets both.
+//   §O7 A transfer that keeps moving gets no Timer P backup and its outcome
+//       wait does not go quiet; a silent one gets both.
 //   §O8 A tier carrying a Resource hands over to the next tier only on its
 //       own failure event (its Resource concluding FAILED, which covers its
 //       link closing and an advertisement nobody answers), never on the
-//       stagger; a tier carrying one packet keeps the DIRECT_STAGGER_WAIT
-//       stagger.
+//       stagger and never on the outcome backstop (a Resource queued behind
+//       another on its link, or stalled, waits past it); a tier carrying one
+//       packet keeps the DIRECT_STAGGER_WAIT stagger.
 //   §O9 One outcome per send: on_delivered once, from the first tier to
 //       deliver; on_failed once, only after every tier that fired has
 //       failed (a tier-3 setup failure never fails a send with a tier still
-//       in flight); anything later is ignored.
+//       in flight, nor does the backstop on a Resource tier); anything later
+//       is ignored, except a delivery after on_failed, which still reaches
+//       on_delivered once (a late proof).
 //
 // §O8/§O9 drive the production tier chain (`drive_tier_chain`) over fake
 // links (`FakeTiers`); §O8's advertisement case runs a real Resource's own
@@ -3619,10 +3691,9 @@ mod tests {
         // §O8: the stagger is for packets. A Resource tier is heard to its
         // own outcome instead, before the next tier may fire.
         for (tier, rx) in [("Inbound", "tier1_rx"), ("Cached", "tier2_rx")] {
-            let branch = fragment
-                .split(&format!("Self::await_tier(outcome, Tier::{}, &{}, &watch, pacing.backstop)", tier, rx))
-                .next()
-                .expect("tier branch");
+            let heard = format!("Self::await_tier(outcome, Tier::{}, &{}, &watch, pacing.backstop, representation)", tier, rx);
+            assert!(fragment.contains(&heard), "tier {} must hear its Resource's outcome: {}", tier, heard);
+            let branch = fragment.split(&heard).next().expect("tier branch");
             let resource_branch = branch.rfind("if resource {").expect("each staggered tier branches on the representation");
             assert!(
                 !branch[resource_branch..].contains("sleep("),
@@ -4182,8 +4253,9 @@ mod tests {
     }
 
     // §O9 (3) — every tier that fired fails, one after another: on_failed
-    // once, only after the last of them, and nothing a tier reports after
-    // that (a second failure, a late delivery) reaches the caller.
+    // once, only after the last of them. A second failure after that is
+    // ignored. A delivery after it is not: it reaches on_delivered, once,
+    // after on_failed.
     #[test]
     fn on_failed_fires_once_after_the_last_fired_tier_fails() {
         let step = Duration::from_millis(80);
@@ -4203,7 +4275,35 @@ mod tests {
         assert!(links.asked_at(Tier::NewLink).unwrap() >= step * 2, "each tier fired on the failure of the one before");
         assert_eq!(heard.failed.len(), 1, "on_failed exactly once: {:?}", heard);
         assert!(heard.failed[0] >= step * 3, "only after tier 3, the last, failed: {:?}", heard);
-        assert!(heard.delivered.is_empty(), "a delivery reported after the send failed is ignored: {:?}", heard);
+        assert_eq!(heard.delivered.len(), 1, "a delivery after the send failed is reported, once: {:?}", heard);
+        assert!(heard.delivered[0] > heard.failed[0], "{:?}", heard);
+    }
+
+    // §O9 (3) — a late proof (Reticulum-rust PARITY-AUDIT B35): tier 3's
+    // packet receipt times out, which fails the send, and then the peer's
+    // proof arrives. The caller hears on_failed and then on_delivered, each
+    // once. Earlier on 2026-09-29 the delivery was swallowed and the message
+    // stayed FAILED although the peer had proved it.
+    #[test]
+    fn a_proof_after_the_send_failed_still_reaches_on_delivered() {
+        let times_out = Duration::from_millis(20);
+        let proved = Duration::from_millis(60);
+        let late_proof: Option<FakeFire> = Some(Box::new(move |report: TierReport, _: &TransferWatch| {
+            std::thread::spawn(move || {
+                std::thread::sleep(times_out);
+                (report.failed)();
+                std::thread::sleep(proved - times_out);
+                (report.delivered)();
+                (report.delivered)();
+            });
+            true
+        }));
+        let links = FakeTiers::new(None, None, late_proof);
+        let heard = drive(&links, LinkRepresentation::Packet, test_pacing(), Duration::from_millis(150));
+        assert_eq!(heard.failed.len(), 1, "{:?}", heard);
+        assert!(heard.failed[0] >= times_out && heard.failed[0] < proved, "at the receipt's timeout: {:?}", heard);
+        assert_eq!(heard.delivered.len(), 1, "the late proof is reported, once: {:?}", heard);
+        assert!(heard.delivered[0] >= proved, "{:?}", heard);
     }
 
     // §O9 (3), packets — the tiers' packets are in flight together, so the
@@ -4309,6 +4409,130 @@ mod tests {
         );
         assert_eq!(heard.delivered.len(), 1, "tier 2 delivered: {:?}", heard);
         assert!(heard.failed.is_empty(), "{:?}", heard);
+    }
+
+    // §O8 (5b) — tier 1's Resource is QUEUED behind another transfer on its
+    // link. RNS 1.5.2 Resource.py waits there with no clock, however long the
+    // transfer ahead takes, and so does the chain. Several backstops pass with
+    // no outcome and no activity, and tier 2, which would deliver at once, is
+    // not fired. Tier 2 fires when tier 1's Resource fails by its own path.
+    // Here its link closes, the Resource finds the link is not active
+    // (`ensure_link`), and it concludes FAILED. The test uses a real Resource
+    // and its real advertise job, on a real link. The transfer ahead is a
+    // second Resource registered on that link. Earlier on 2026-09-29 the
+    // backstop handed tier 1 over while it was queued, so a photo sent behind
+    // another photo went out twice.
+    #[test]
+    fn a_resource_queued_behind_another_on_its_link_is_not_handed_over_at_the_backstop() {
+        use reticulum_rust::resource::{Resource, ResourceStatus};
+        let pacing = ChainPacing { backstop: Duration::from_millis(100), ..test_pacing() };
+        let queued_for = pacing.backstop * 6;
+        let status_at_close: Arc<Mutex<Option<ResourceStatus>>> = Arc::new(Mutex::new(None));
+        let seen = status_at_close.clone();
+        let queued: Option<FakeFire> = Some(Box::new(move |report: TierReport, watch: &TransferWatch| {
+            let mut resource = sending_resource(8, watch.resource_progress(report.gate.clone()));
+            resource.callback = Some(AppLinks::resource_concluded(
+                report.gate.clone(),
+                report.delivered.clone(),
+                Some(report.failed.clone()),
+            ));
+            let link = resource.link.clone();
+            let ahead = sending_resource(8, Arc::new(|_: Arc<Mutex<Resource>>| {}));
+            link.register_outgoing_resource(Arc::new(Mutex::new(ahead)));
+            let resource = Arc::new(Mutex::new(resource));
+            Resource::advertise_shared(resource.clone());
+            let seen = seen.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(queued_for);
+                *seen.lock().unwrap() = resource.lock().ok().map(|r| r.status);
+                link.teardown();
+            });
+            true
+        }));
+        let links = FakeTiers::new(queued, silent(Duration::ZERO, true), silent(Duration::ZERO, true));
+        let heard = drive(&links, LinkRepresentation::Resource, pacing, Duration::from_millis(50));
+
+        assert_eq!(
+            *status_at_close.lock().unwrap(),
+            Some(ResourceStatus::Queued),
+            "tier 1's Resource was still queued behind the transfer ahead when its link closed"
+        );
+        let tier2 = links.asked_at(Tier::Cached).expect("tier 2 fires once tier 1's Resource has failed");
+        assert!(
+            tier2 >= queued_for,
+            "tier 2 fired at {:?}, while tier 1's Resource was queued (backstop {:?})",
+            tier2, pacing.backstop
+        );
+        assert_eq!(links.asked(), vec![Tier::Inbound, Tier::Cached], "tier 2 delivered: no tier 3");
+        assert_eq!(heard.delivered.len(), 1, "{:?}", heard);
+        assert!(heard.failed.is_empty(), "{:?}", heard);
+    }
+
+    // §O8 (5c) — tier 1's Resource moves, stalls for several backstops, and
+    // resumes to deliver. It is still inside its own give-up time (RNS 1.5.2
+    // Resource.py, transferring: RTT × 4 × 16 + 78 s, past 120 s once the RTT
+    // is over 0.66 s). The backstop neither hands it over nor fails it. Tier
+    // 3, whose path race would fail, is never tried, and the send is
+    // delivered. Earlier on 2026-09-29 the backstop failed tier 1 here. Tier
+    // 3's setup failure then failed the send while tier 1 could still
+    // deliver, and tier 1's delivery was ignored.
+    #[test]
+    fn a_resource_stalled_past_the_backstop_is_neither_handed_over_nor_failed() {
+        let pacing = ChainPacing { backstop: Duration::from_millis(100), ..test_pacing() };
+        let stalls_for = pacing.backstop * 4;
+        let stalls: Option<FakeFire> = Some(Box::new(move |report: TierReport, watch: &TransferWatch| {
+            let progress = watch.reporter(report.gate.clone());
+            std::thread::spawn(move || {
+                progress(0.25);
+                std::thread::sleep(stalls_for);
+                progress(0.5);
+                progress(0.75);
+                (report.delivered)();
+            });
+            true
+        }));
+        let links = FakeTiers::new(stalls, None, setup_fails());
+        let heard = drive(&links, LinkRepresentation::Resource, pacing, Duration::from_millis(50));
+        assert_eq!(links.asked(), vec![Tier::Inbound], "{:?}", heard);
+        assert!(heard.failed.is_empty(), "{:?}", heard);
+        assert_eq!(heard.delivered.len(), 1, "{:?}", heard);
+        assert!(heard.delivered[0] >= stalls_for, "{:?}", heard);
+    }
+
+    // §O9 (3) — the only tier that fired carries a Resource that goes quiet
+    // past the backstop and then fails by its own event: on_failed comes at
+    // that failure, not at the backstop. A packet tier whose receipt callback
+    // never comes is still failed at the backstop: that is the lost callback
+    // it guards.
+    #[test]
+    fn the_backstop_fails_a_quiet_packet_tier_but_never_a_resource_tier() {
+        let pacing = ChainPacing { backstop: Duration::from_millis(100), ..test_pacing() };
+        let fails_at = pacing.backstop * 4;
+        let links = FakeTiers::new(None, None, silent(fails_at, false));
+        let heard = drive(&links, LinkRepresentation::Resource, pacing, Duration::from_millis(50));
+        assert_eq!(heard.failed.len(), 1, "{:?}", heard);
+        assert!(
+            heard.failed[0] >= fails_at,
+            "at the Resource's own failure, not at the backstop ({:?}): {:?}",
+            pacing.backstop, heard
+        );
+        assert!(heard.delivered.is_empty(), "{:?}", heard);
+
+        let never: Option<FakeFire> = Some(Box::new(move |report: TierReport, _: &TransferWatch| {
+            std::thread::spawn(move || {
+                std::thread::sleep(fails_at);
+                drop(report);
+            });
+            true
+        }));
+        let links = FakeTiers::new(None, None, never);
+        let heard = drive(&links, LinkRepresentation::Packet, pacing, Duration::from_millis(50));
+        assert_eq!(heard.failed.len(), 1, "{:?}", heard);
+        assert!(
+            heard.failed[0] >= pacing.backstop && heard.failed[0] < fails_at,
+            "a packet tier with no outcome fails at the backstop: {:?}",
+            heard
+        );
     }
 
     // §O8 (6) — a message that fits one link packet keeps the stagger as it
