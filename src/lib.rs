@@ -54,7 +54,7 @@
 //! link in the registry until it closes or the destination is explicitly
 //! closed.
 //!
-//! # Send tiers  (see DESIGN_PRINCIPLES.md §1, §3, §7)
+//! # Send tiers  (see DESIGN_PRINCIPLES.md §1, §3, §5, §7)
 //!
 //! `AppLinks::send(dest, packed, on_delivered, on_propagation_needed, on_failed)` drives:
 //!
@@ -68,33 +68,57 @@
 //! upload the whole payload a second time.  (Until 2026-09-29 Timer P fired
 //! 5 s after `send` whatever the transfer was doing: an iPad photo, 1708
 //! parts over a Nearby RTNode Bluetooth link, got a backup copy 5 s into a
-//! direct transfer that went on to deliver.)  When the current APP_LINK
-//! status is already `DISCONNECTED` it fires immediately so propagation can
-//! start in parallel with the fresh direct cascade.
-//! This is independent of the tier chain.
+//! direct transfer that went on to deliver.)  The activity clock is shared
+//! by every tier, so a Resource that fails on one tier and starts on the
+//! next is one transfer to Timer P: only the quiet time counts, across the
+//! handover.  When the current APP_LINK status is already `DISCONNECTED` it
+//! fires immediately so propagation can start in parallel with the fresh
+//! direct cascade.  This is independent of the tier chain.
 //!
-//!   * **Tier 1** — peer-initiated inbound link (they opened it to us):
-//!     fire the packed bytes, wait ≤1 s (Timer A) for delivery proof.
-//!     DO NOT tear down the in-flight packet if Timer A expires.
-//!   * **Tier 2** — cached outbound link (`STATE_ACTIVE`): fire, wait ≤1 s
-//!     (Timer B).  DO NOT tear down tier-1's in-flight packet.
+//!   * **Tier 1** — peer-initiated inbound link (they opened it to us).
+//!   * **Tier 2** — cached outbound link (`STATE_ACTIVE`).
 //!   * **Tier 3** — `expire_path` → `race_path` (≤5 s) → `Link::new_outbound`
-//!     + `initiate` (≤5 s) → fire → wait for the stack's outcome: the
-//!     delivery proof, the link packet's receipt timeout, or the Resource
-//!     concluding.  `on_failed` fires on the stack's failure event, or when
-//!     the 120 s backstop passes with no outcome AND no transfer activity
-//!     (since 2026-09-29; it used to fail a Resource that was still moving
-//!     once 120 s had passed since the fire).
+//!     + `initiate` (≤5 s) → fire.  A setup failure (race, identity, link
+//!     establishment) means tier 3 did not fire.
+//!
+//! How a tier hands over to the next depends on how the message travels
+//! ([`link_representation`]):
+//!
+//!   * **One link packet** (up to the link MDU): each tier fires, and the
+//!     next fires [`DIRECT_STAGGER_WAIT`] (1 s, Timer A / Timer B) later
+//!     unless the send has been delivered by then.  The earlier packet stays
+//!     in flight; its receipt (proof or RTT-scaled timeout) still counts.
+//!   * **A Resource** (over the link MDU): each tier's Resource runs to its
+//!     own outcome, and the next tier fires only on that tier's own failure
+//!     event — its Resource concluding without COMPLETE.  That is also how a
+//!     Resource ends when its link closes (RNS/Link.py `link_closed` cancels
+//!     it) and when the receiver never starts the transfer (RNS/Resource.py
+//!     watchdog: the advertisement unanswered through `MAX_ADV_RETRIES`).
+//!     Never because a clock ran.  A Resource QUEUED behind another transfer
+//!     on its link waits its turn, as the reference does.
+//!
+//! Until 2026-09-29 every tier fired 1 s after the one before whatever the
+//! payload, so a Resource went out two or three times at once: an iPad
+//! photo over the Bluetooth RTNode link ran as two concurrent 3700-part
+//! Resources, each at half the link's speed.  And tiers 1 and 2 reported no
+//! failure, so tier 3 alone decided `on_failed`: a tier-3 path race or link
+//! that failed FAILED the message while tier 1's Resource was still moving.
+//!
+//! One outcome per send (`SendOutcome`): `on_delivered` once, from whichever
+//! tier delivers first; `on_failed` once, only when the chain will fire no
+//! more tiers and every tier that fired has failed (or no tier could fire).
+//! Anything a tier reports after the outcome is logged and ignored.  Each
+//! fired tier's outcome wait has the 120 s backstop, which counts only time
+//! with neither an outcome nor transfer activity: it guards a lost callback
+//! and never decides a moving transfer.
 //!
 //! `send_with_compression` and `send_on_held_link` take an optional progress
 //! callback that hears the Resource's own fraction (`Resource::get_progress`,
 //! RNS/Resource.py `get_progress`) after each request the receiver makes,
 //! until delivery.  A payload that fits one link packet reports nothing.
 //!
-//! All tiers share an `AtomicBool` delivered gate — the first delivery proof
-//! from any tier wins and the others are silently ignored (idempotent).
-//! All tiers are independent: advancing to the next tier NEVER cancels or
-//! closes resources belonging to the previous tier.
+//! Advancing to the next tier NEVER cancels or closes the packet or Resource
+//! of an earlier tier.
 //!
 //! # Open / liveness
 //!
@@ -134,8 +158,18 @@ pub const APP_LINK_ESTABLISHING: u8 = 0x02;
 pub const APP_LINK_ACTIVE: u8 = 0x03;
 pub const APP_LINK_DISCONNECTED: u8 = 0x04;
 
-/// Tier-advance stagger.  After tier-1 fires, tier-2 fires this many
-/// seconds later (if tier-1 has not delivered within that window).
+/// Tier-advance stagger for a message that fits ONE link packet: after a
+/// tier fires its packet, the next tier fires this many seconds later unless
+/// the send has been delivered by then.  The earlier packet stays in flight.
+///
+/// A message over the link MDU travels as a Resource and does not use this:
+/// the next tier fires only on the earlier tier's own failure event (its
+/// Resource concluding FAILED: rejected, the link closed, the advertisement
+/// unanswered through its retries, a part or proof timed out), never because
+/// this second passed.  Until 2026-09-29 every tier fired its own full
+/// Resource 1 s after the one before, so a photo went out two or three times
+/// at once and each copy ran at a fraction of the link's speed.
+///
 /// Owned here because AppLinks drives all tier scheduling.
 pub const DIRECT_STAGGER_WAIT: f64 = 1.0;
 
@@ -202,9 +236,10 @@ pub type InboundLinkEstablishedCallback = Arc<dyn Fn() + Send + Sync + 'static>;
 /// (RNS/Resource.py `get_progress`), called after each request the receiver
 /// makes, until the send is delivered.  The caller maps it onto its own
 /// scale (LXMF: 0.10 + 0.90 × fraction, LXMF/LXMessage.py
-/// `__update_transfer_progress`).  With several tiers in flight each tier's
-/// Resource reports its own fraction, so the values need not rise
-/// monotonically.  A send that fits one link packet reports nothing.
+/// `__update_transfer_progress`).  When one tier's Resource fails and the
+/// next tier's starts, the fraction starts again from that Resource's own
+/// beginning, so the values need not rise monotonically.  A send that fits
+/// one link packet reports nothing.
 /// Keep it short: it runs on the thread serving the receiver's request,
 /// with that Resource's lock held, and must never wait on the link.
 pub type SendProgressCallback = Arc<dyn Fn(f64) + Send + Sync + 'static>;
@@ -1483,11 +1518,23 @@ impl AppLinks {
     //            STATE_ACTIVE.
     //   Tier 3 — expire_path + race_path + Link::new_outbound + send.
     //
-    // Each tier fires at t=0, t=1s, t=2s respectively (Timer A/B).  A
-    // parallel Timer P fires on_propagation_needed once the send has gone
-    // 5 s undelivered with no transfer activity (a Resource reporting more
-    // of the message sent restarts the 5 s).
-    // All tiers share an AtomicBool gate; advancing never cancels prior tiers.
+    // A message that fits one link packet: the tiers fire at t=0, t=1s,
+    // t=2s (Timer A/B, DIRECT_STAGGER_WAIT), each only while the send is
+    // still undelivered.
+    // A message over the link MDU travels as a Resource, and a tier hands
+    // over to the next only on its OWN failure event (its Resource
+    // concluding without COMPLETE: failed, rejected, its link closed, its
+    // advertisement unanswered through MAX_ADV_RETRIES), never on a clock.
+    // Until 2026-09-29 the Resource tiers staggered by 1 s like packets, and
+    // a photo went out as two or three concurrent full Resources.
+    //
+    // One SendOutcome decides the send: on_delivered once, from the first
+    // tier to deliver; on_failed once, when the chain fires no more tiers and
+    // every tier that fired has failed (or none could fire). A parallel
+    // Timer P fires on_propagation_needed once the send has gone 5 s
+    // undelivered with no transfer activity on any tier (a Resource
+    // reporting more of the message sent restarts the 5 s).
+    // Advancing never cancels an earlier tier.
     //
     // Spawns a background thread; returns immediately (§7).
 
@@ -1496,15 +1543,21 @@ impl AppLinks {
     /// Non-blocking.  Spawns a background thread; returns immediately.
     ///
     /// Callbacks (all MUST be idempotent and MUST NOT block):
-    ///   `on_delivered`           — first delivery proof from any tier.
+    ///   `on_delivered`           — once, the first delivery proof (or
+    ///                              Resource COMPLETE) from any tier.
     ///   `on_propagation_needed`  — Timer P: the send went
     ///                              [`PROP_FALLBACK_DELAY`] (5 s) undelivered
     ///                              with no transfer activity; caller should
     ///                              start a parallel propagation send.
-    ///   `on_failed`              — tier 3's transfer failed (the stack's own
-    ///                              failure event), or went the 120 s
-    ///                              outcome backstop with neither an
-    ///                              outcome nor transfer activity.
+    ///   `on_failed`              — once, when every tier that fired has
+    ///                              failed by its own failure event (packet
+    ///                              receipt timeout, Resource concluded
+    ///                              without COMPLETE) and no tier is left to
+    ///                              fire, or when no tier could fire at all.
+    ///                              A fired tier that goes the 120 s outcome
+    ///                              backstop with neither an outcome nor
+    ///                              transfer activity counts as failed.
+    ///                              Never while a fired tier is in flight.
     pub fn send(
         dest: &[u8],
         packed: Vec<u8>,
@@ -1578,11 +1631,8 @@ impl AppLinks {
         Self::send(dest, packed, on_delivered, on_propagation_needed, on_failed);
     }
 
-    /// Drive the tier chain on the background send thread.
-    ///
-    /// Timer P runs in parallel on its own thread. Tier advancement waits only
-    /// when an earlier tier actually queued a packet, so empty tiers never burn
-    /// direct-send budget before the first real LRREQ.
+    /// Drive the tier chain on the background send thread: the stack's own
+    /// links ([`StackTiers`]) under production's clocks.
     fn run_tier_chain(
         dest: &[u8],
         packed: Vec<u8>,
@@ -1592,13 +1642,57 @@ impl AppLinks {
         on_failed: Arc<dyn Fn() + Send + Sync + 'static>,
         on_progress: Option<SendProgressCallback>,
     ) {
-        // Shared delivered gate.  The first delivery proof from any tier wins.
-        let delivered = Arc::new(AtomicBool::new(false));
-        // Shared by every tier's Resource: the caller's progress callback and
-        // the send's activity clock, which Timer P and the tier-3 backstop
-        // read so that they count only time without transfer activity.
-        let watch = TransferWatch::new(on_progress);
         let prop_delay = Self::prop_fallback_delay_for_status(Self::status(dest));
+        let pacing = ChainPacing {
+            stagger: Duration::from_secs_f64(DIRECT_STAGGER_WAIT),
+            prop_delay,
+            backstop: OUTCOME_BACKSTOP,
+        };
+        // Timer P firing turns the destination red, unless it was already
+        // DISCONNECTED (the zero delay).
+        let dest_p = dest.to_vec();
+        let on_prop: Arc<dyn Fn() + Send + Sync + 'static> = Arc::new(move || {
+            if prop_delay > Duration::ZERO {
+                AppLinks::mark_prop_fallback_disconnected(&dest_p);
+            }
+            on_propagation_needed();
+        });
+        let outcome = SendOutcome::new(dest, on_delivered, on_failed);
+        let links = StackTiers { dest, packed: &packed, compress };
+        Self::drive_tier_chain(
+            &links,
+            link_representation(packed.len()),
+            pacing,
+            &outcome,
+            on_prop,
+            on_progress,
+        );
+    }
+
+    /// The tier chain, over any [`TierLinks`]: the stack's own links in
+    /// production, fakes in the tests. Runs on the send thread and returns
+    /// once it has fired every tier it will fire and heard each fired tier's
+    /// own outcome (or that tier's backstop); `outcome` decides the send.
+    ///
+    /// Timer P runs in parallel on its own thread. Tier advancement waits only
+    /// when an earlier tier actually put something in flight, so empty tiers
+    /// never burn direct-send budget before the first real LRREQ.
+    fn drive_tier_chain(
+        links: &impl TierLinks,
+        representation: LinkRepresentation,
+        pacing: ChainPacing,
+        outcome: &Arc<SendOutcome>,
+        on_propagation_needed: Arc<dyn Fn() + Send + Sync + 'static>,
+        on_progress: Option<SendProgressCallback>,
+    ) {
+        // The send's delivered gate: set once, by the first tier to deliver.
+        let delivered = outcome.delivered.clone();
+        // Shared by every tier's Resource: the caller's progress callback and
+        // the send's activity clock, which Timer P and every tier's outcome
+        // backstop read so that they count only time without transfer
+        // activity — on any tier, across the handover from one to the next.
+        let watch = TransferWatch::new(on_progress);
+        let prop_delay = pacing.prop_delay;
 
         // ── Timer P: propagation fallback ─────────────────────────────
         //
@@ -1618,113 +1712,107 @@ impl AppLinks {
         {
             let delivered_p = delivered.clone();
             let activity_p = watch.activity.clone();
-            let dest_p = dest.to_vec();
             let on_prop = on_propagation_needed;
             std::thread::Builder::new()
                 .name("app_links_prop_timer".into())
                 .spawn(move || {
-                    Self::run_prop_timer(prop_delay, &delivered_p, &activity_p, || {
-                        if prop_delay > Duration::ZERO {
-                            AppLinks::mark_prop_fallback_disconnected(&dest_p);
-                        }
-                        on_prop();
-                    });
+                    Self::run_prop_timer(prop_delay, &delivered_p, &activity_p, || on_prop());
                 })
                 .expect("failed to spawn app-links Timer P");
         }
 
+        // How a tier hands over to the next (see "Send tiers" at the top of
+        // this file): a Resource tier only on its own failure event, a packet
+        // tier after the stagger.
+        let resource = representation == LinkRepresentation::Resource;
+        // Packet tiers still in flight when the chain moved on. Their own
+        // receipt events (proof or timeout) still decide the send; the chain
+        // hears them at the end, under the same backstop.
+        let mut unheard: Vec<(Tier, std::sync::mpsc::Receiver<bool>)> = Vec::new();
+
         // ── Tier 1: inbound link ──────────────────────────────────────
         // Fires immediately when a peer-initiated inbound link already exists.
-        let inbound = Self::get_inbound_handle(dest)
-            .filter(|h| h.status() == STATE_ACTIVE);
-
-        let tier1_fired = if let Some(handle) = inbound {
-            log(
-                &format!("[APP_LINK] send tier-1 (inbound link) for {}", hexrep(dest, false)),
-                LOG_NOTICE, false, false,
-            );
-            Self::fire_on_link(
-                &handle,
-                &packed,
-                compress,
-                delivered.clone(),
-                on_delivered.clone(),
-                None,
-                &watch,
-            )
-        } else {
-            false
-        };
-
-        // Timer A: only wait when tier 1 actually put a packet in flight.
+        let (report, tier1_rx) = outcome.arm(Tier::Inbound);
+        let tier1_fired = links.fire(
+            Tier::Inbound,
+            report,
+            &watch,
+        );
         if tier1_fired {
-            std::thread::sleep(Duration::from_secs_f64(DIRECT_STAGGER_WAIT));
-            if delivered.load(Ordering::Acquire) {
-                log(
-                    &format!("[APP_LINK] send delivered via tier-1 for {}", hexrep(dest, false)),
-                    LOG_NOTICE,
-                    false,
-                    false,
-                );
-                return;
+            if resource {
+                // The Resource runs to its own outcome. Tier 2 fires only if
+                // it fails; a moving transfer gets no second copy.
+                if Self::await_tier(outcome, Tier::Inbound, &tier1_rx, &watch, pacing.backstop) {
+                    return;
+                }
+            } else {
+                // Timer A: only wait when tier 1 actually put a packet in flight.
+                std::thread::sleep(pacing.stagger);
+                if delivered.load(Ordering::Acquire) {
+                    return;
+                }
+                unheard.push((Tier::Inbound, tier1_rx));
             }
+        } else {
+            outcome.not_fired(Tier::Inbound);
         }
 
         // ── Tier 2: cached outbound link ─────────────────────────────
-        let outbound = REGISTRY
-            .lock()
-            .ok()
-            .and_then(|r| r.links.get(dest).cloned())
-            .filter(|h| h.status() == STATE_ACTIVE);
-
-        let tier2_fired = if let Some(handle) = outbound {
-            log(
-                &format!("[APP_LINK] send tier-2 (cached outbound link) for {}", hexrep(dest, false)),
-                LOG_NOTICE,
-                false,
-                false,
-            );
-            Self::fire_on_link(
-                &handle,
-                &packed,
-                compress,
-                delivered.clone(),
-                on_delivered.clone(),
-                None,
-                &watch,
-            )
-        } else {
-            false
-        };
-
-        // Timer B: only wait when tier 2 actually put a packet in flight.
+        if delivered.load(Ordering::Acquire) {
+            return;
+        }
+        let (report, tier2_rx) = outcome.arm(Tier::Cached);
+        let tier2_fired = links.fire(
+            Tier::Cached,
+            report,
+            &watch,
+        );
         if tier2_fired {
-            std::thread::sleep(Duration::from_secs_f64(DIRECT_STAGGER_WAIT));
-            if delivered.load(Ordering::Acquire) {
-                log(
-                    &format!("[APP_LINK] send delivered via tier-2 for {}", hexrep(dest, false)),
-                    LOG_NOTICE,
-                    false,
-                    false,
-                );
-                return;
+            if resource {
+                // As tier 1: tier 3 fires only if this Resource fails.
+                if Self::await_tier(outcome, Tier::Cached, &tier2_rx, &watch, pacing.backstop) {
+                    return;
+                }
+            } else {
+                // Timer B: only wait when tier 2 actually put a packet in flight.
+                std::thread::sleep(pacing.stagger);
+                if delivered.load(Ordering::Acquire) {
+                    return;
+                }
+                unheard.push((Tier::Cached, tier2_rx));
             }
+        } else {
+            outcome.not_fired(Tier::Cached);
         }
 
         // ── Tier 3: path verification + new link + send ──────────────
         if delivered.load(Ordering::Acquire) {
             return;
         }
-
-        Self::run_tier3(
-            dest,
-            &packed,
-            compress,
-            delivered,
-            on_delivered,
-            on_failed,
+        let (report, tier3_rx) = outcome.arm(Tier::NewLink);
+        let tier3_fired = links.fire(
+            Tier::NewLink,
+            report,
             &watch,
         );
+        if !tier3_fired {
+            // Its path race or link failed (logged in `run_tier3`). That
+            // fails the send only if no earlier tier is still in flight.
+            outcome.not_fired(Tier::NewLink);
+        }
+        // Nothing fires after tier 3: from here the last in-flight tier's own
+        // failure fails the send — or it fails now, if every tier that fired
+        // has already failed or none could fire.
+        outcome.exhausted();
+        if tier3_fired {
+            Self::await_tier(outcome, Tier::NewLink, &tier3_rx, &watch, pacing.backstop);
+        }
+        for (tier, rx) in unheard {
+            if outcome.is_decided() {
+                break;
+            }
+            Self::await_tier(outcome, tier, &rx, &watch, pacing.backstop);
+        }
     }
 
     /// Timer P's clock, on the Timer P thread: waits until the send has gone
@@ -1761,24 +1849,20 @@ impl AppLinks {
         }
     }
 
-    fn fire_failed_if_undelivered(
-        delivered: &Arc<AtomicBool>,
-        on_failed: &Arc<dyn Fn() + Send + Sync + 'static>,
-    ) {
-        if !delivered.load(Ordering::Acquire) {
-            on_failed();
-        }
-    }
-
+    /// Tier 3: a fresh path race, a new outbound link, and the message fired
+    /// on it, reporting through `report`. Returns whether the message was put
+    /// in flight. Every setup failure (path race, identity, destination, link
+    /// establishment) is logged here and means tier 3 did not fire: it fails
+    /// the send only when no earlier tier is still in flight (`SendOutcome`).
+    /// Until 2026-09-29 each of them called `on_failed` directly, and failed
+    /// the message while tier 1's Resource was still moving.
     fn run_tier3(
         dest: &[u8],
         packed: &[u8],
         compress: bool,
-        delivered: Arc<AtomicBool>,
-        on_delivered: Arc<dyn Fn() + Send + Sync + 'static>,
-        on_failed: Arc<dyn Fn() + Send + Sync + 'static>,
+        report: TierReport,
         watch: &TransferWatch,
-    ) {
+    ) -> bool {
         log(
             &format!("[APP_LINK] send tier-3 (path race + new link) for {}", hexrep(dest, false)),
             LOG_NOTICE, false, false,
@@ -1801,8 +1885,7 @@ impl AppLinks {
                     false,
                     false,
                 );
-                Self::fire_failed_if_undelivered(&delivered, &on_failed);
-                return;
+                return false;
             }
         };
 
@@ -1824,8 +1907,7 @@ impl AppLinks {
                     false,
                     false,
                 );
-                Self::fire_failed_if_undelivered(&delivered, &on_failed);
-                return;
+                return false;
             }
         };
 
@@ -1852,8 +1934,7 @@ impl AppLinks {
                     false,
                     false,
                 );
-                Self::fire_failed_if_undelivered(&delivered, &on_failed);
-                return;
+                return false;
             }
         };
 
@@ -1870,8 +1951,7 @@ impl AppLinks {
                     false,
                     false,
                 );
-                Self::fire_failed_if_undelivered(&delivered, &on_failed);
-                return;
+                return false;
             }
         };
 
@@ -1908,8 +1988,7 @@ impl AppLinks {
                 false,
                 false,
             );
-            Self::fire_failed_if_undelivered(&delivered, &on_failed);
-            return;
+            return false;
         }
 
         let established_handle = match est_rx.recv_timeout(LIVENESS_BUDGET) {
@@ -1924,8 +2003,7 @@ impl AppLinks {
                     false,
                     false,
                 );
-                Self::fire_failed_if_undelivered(&delivered, &on_failed);
-                return;
+                return false;
             }
             Err(_) => {
                 log(
@@ -1937,8 +2015,7 @@ impl AppLinks {
                     false,
                     false,
                 );
-                Self::fire_failed_if_undelivered(&delivered, &on_failed);
-                return;
+                return false;
             }
         };
 
@@ -1964,86 +2041,87 @@ impl AppLinks {
             })));
         }
 
-        if delivered.load(Ordering::Acquire) {
-            return;
+        // A packet on an earlier tier may have been proved while this link
+        // came up: then there is nothing left to send.
+        if report.send_delivered.load(Ordering::Acquire) {
+            log(
+                &format!(
+                    "[APP_LINK] send tier-3: already delivered by an earlier tier; nothing fired on the new link to {}",
+                    hexrep(dest, false)
+                ),
+                LOG_NOTICE, false, false,
+            );
+            return false;
         }
 
-        // Fire and wait for the OUTCOME: the delivery proof, or the stack's
-        // own failure event (the link packet's RTT-scaled receipt timeout,
-        // or the Resource concluding without COMPLETE), as RNS/LXMF do.
-        // Until 2026-09-23 this waited a fixed LIVENESS_BUDGET (5 s) after
-        // the link came up and then declared failure while a transfer was
-        // still in flight: on a 3 s RTT link a Resource cannot finish in 5 s,
-        // so every direct message over the MDU "failed" and went to
-        // propagation. The 5-second promise to the user is Timer P above
-        // (propagation fallback), not this wait.
-        // Until 2026-09-29 the OUTCOME_BACKSTOP was the same mistake on a
-        // longer clock: 120 s after the fire it failed a Resource that was
-        // still moving (an iPad photo, ~4 minutes over Bluetooth, reported
-        // FAILED at 120 s and DELIVERED later). The backstop now counts only
-        // time with no outcome AND no transfer activity (`await_outcome`).
-        // Interruptible: the callbacks send on outcome_tx so this thread
-        // wakes at once. NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
-        let (outcome_tx, outcome_rx) = std::sync::mpsc::sync_channel::<bool>(2);
-        let proof_on_delivered = on_delivered.clone();
-        let proof_tx = outcome_tx.clone();
-        let proof_cb: Arc<dyn Fn() + Send + Sync + 'static> = Arc::new(move || {
-            proof_on_delivered();
-            let _ = proof_tx.try_send(true);
-        });
-        let fail_tx = outcome_tx;
-        let fail_cb: Arc<dyn Fn() + Send + Sync + 'static> = Arc::new(move || {
-            let _ = fail_tx.try_send(false);
-        });
+        // Fire; the chain hears the outcome (`await_tier`).
         let fired = Self::fire_on_link(
             &established_handle,
-            &packed,
+            packed,
             compress,
-            delivered.clone(),
-            proof_cb,
-            Some(fail_cb),
+            report.gate,
+            report.delivered,
+            Some(report.failed),
             watch,
         );
         if !fired {
-            Self::fire_failed_if_undelivered(&delivered, &on_failed);
-            return;
+            log(
+                &format!(
+                    "[APP_LINK] send tier-3: the message could not be put in flight on the new link to {}",
+                    hexrep(dest, false)
+                ),
+                LOG_NOTICE, false, false,
+            );
         }
-        match Self::await_outcome(&outcome_rx, &watch.activity, OUTCOME_BACKSTOP) {
-            OutcomeWait::Delivered => {
-                log(
-                    &format!("[APP_LINK] send delivered via tier-3 for {}", hexrep(dest, false)),
-                    LOG_NOTICE, false, false,
-                );
-            }
-            OutcomeWait::Failed => {
-                log(
-                    &format!("[APP_LINK] send tier-3: the stack reported delivery failed (receipt timed out or Resource failed) for {}", hexrep(dest, false)),
-                    LOG_NOTICE, false, false,
-                );
-                Self::fire_failed_if_undelivered(&delivered, &on_failed);
-            }
+        fired
+    }
+
+    /// Hear one fired tier's own outcome, as RNS/LXMF decide it: delivered
+    /// (the link packet proved, or its Resource concluded COMPLETE) or failed
+    /// (the packet receipt's RTT-scaled timeout, or its Resource concluding
+    /// without COMPLETE). Returns whether that tier delivered; `outcome` has
+    /// already heard it from the tier's own callbacks.
+    ///
+    /// The backstop only guards a lost callback: it counts time with neither
+    /// an outcome nor transfer activity (`await_outcome`), and a tier that
+    /// goes the whole backstop that way, or whose callbacks were all dropped
+    /// unheard, is counted as failed here. Until 2026-09-23 tier 3 waited a
+    /// fixed LIVENESS_BUDGET (5 s) after its link came up and then declared
+    /// failure while a transfer was still in flight: on a 3 s RTT link a
+    /// Resource cannot finish in 5 s, so every direct message over the MDU
+    /// "failed" and went to propagation. The 5-second promise to the user is
+    /// Timer P (propagation fallback), not this wait. Until 2026-09-29 the
+    /// OUTCOME_BACKSTOP was the same mistake on a longer clock: 120 s after
+    /// the fire it failed a Resource that was still moving (an iPad photo,
+    /// ~4 minutes over Bluetooth, reported FAILED at 120 s and DELIVERED
+    /// later). Since 2026-09-29 every fired tier is heard this way, not only
+    /// tier 3. Interruptible: the tier's callbacks send on its channel, so
+    /// this thread wakes at once. NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+    fn await_tier(
+        outcome: &SendOutcome,
+        tier: Tier,
+        rx: &std::sync::mpsc::Receiver<bool>,
+        watch: &TransferWatch,
+        backstop: Duration,
+    ) -> bool {
+        match Self::await_outcome(rx, &watch.activity, backstop) {
+            OutcomeWait::Delivered => true,
+            OutcomeWait::Failed => false,
             OutcomeWait::Quiet => {
-                log(
-                    &format!(
-                        "[APP_LINK] send tier-3: no outcome from the stack and no transfer activity for {} s (backstop) for {}",
-                        OUTCOME_BACKSTOP.as_secs(),
-                        hexrep(dest, false)
-                    ),
-                    LOG_NOTICE, false, false,
+                outcome.tier_failed(
+                    tier,
+                    &format!("no outcome from the stack and no transfer activity for {:?} (backstop)", backstop),
                 );
-                Self::fire_failed_if_undelivered(&delivered, &on_failed);
+                false
             }
             OutcomeWait::Dropped => {
-                log(
-                    &format!("[APP_LINK] send tier-3: the stack dropped the transfer without an outcome for {}", hexrep(dest, false)),
-                    LOG_NOTICE, false, false,
-                );
-                Self::fire_failed_if_undelivered(&delivered, &on_failed);
+                outcome.tier_failed(tier, "the stack dropped the transfer without an outcome");
+                false
             }
         }
     }
 
-    /// The tier-3 outcome wait. Returns the stack's outcome for the transfer
+    /// One fired tier's outcome wait. Returns the stack's outcome for the transfer
     /// as soon as it arrives. Fails it (`Quiet`) only once a full `backstop`
     /// has passed since the later of the start of this wait and the last
     /// transfer activity: a transfer that keeps moving is not stuck, and its
@@ -2073,11 +2151,17 @@ impl AppLinks {
         }
     }
 
-    /// Fire `packed` as a Packet on `link` and install delivery callback.
+    /// Fire `packed` on `link` — one link packet, or a Resource over the link
+    /// MDU — and install its outcome callbacks.
     ///
-    /// Returns `true` when the packet was successfully queued (receipt
-    /// obtained).  The `on_delivered` callback fires when LRPROOF arrives.
-    /// The delivered `AtomicBool` gates all callbacks — first LRPROOF wins.
+    /// Returns `true` when the message was put in flight (packet receipt
+    /// obtained, or Resource built and advertising).  `on_delivered` fires
+    /// when the LRPROOF arrives or the Resource concludes COMPLETE, and
+    /// `delivered` gates it: this attempt reports delivery once.  In the tier
+    /// chain `delivered` is the tier's own gate (`TierReport::gate`) and
+    /// `SendOutcome` decides between tiers.  `on_outcome_failed` hears this
+    /// attempt's own failure event: the receipt's timeout, or the Resource
+    /// concluding without COMPLETE.
     fn fire_on_link(
         link: &LinkHandle,
         packed: &[u8],
@@ -2129,37 +2213,22 @@ impl AppLinks {
         true
     }
 
-    /// Send `packed` as a Resource on `link` (LXMF/LXMessage.py: a message
-    /// larger than the link MDU has the RESOURCE representation and is
-    /// delivered by `RNS.Resource(packed, link)`; `__resource_concluded`
-    /// marks it delivered when the status is COMPLETE). Until 2026-09-23
-    /// every direct message left here as ONE link packet, so anything over
-    /// the MDU never left the phone: the packet could not be built, the
-    /// receipt timed out, and the 5-second fallback propagated it instead.
-    ///
-    /// The Resource's progress callback (RNS/Resource.py `request` →
-    /// `progress_callback`, LXMF/LXMessage.py `__as_resource`) reports its
-    /// fraction to the caller and marks transfer activity for Timer P and
-    /// the tier-3 backstop (`TransferWatch::resource_progress`). Until
-    /// 2026-09-29 it was `None`: the message sat at 5 % for the whole
-    /// transfer and the timers took a moving transfer for a stuck one.
-    fn fire_resource_on_link(
-        link: &LinkHandle,
-        packed: &[u8],
-        compress: bool,
+    /// The callback a delivery Resource concludes through. RNS/Resource.py
+    /// runs a Resource's `callback(resource)` once, when it concludes, and
+    /// the status says how: COMPLETE is delivery; anything else is this
+    /// attempt's own failure event — FAILED when the receiver never answered
+    /// the advertisement through `MAX_ADV_RETRIES` (the watchdog's ADVERTISED
+    /// branch), when a part request or the proof timed out, or when the link
+    /// closed under it (RNS/Link.py `link_closed` cancels it); REJECTED when
+    /// the receiver refused it. The Resource's own RTT-scaled timeouts decide
+    /// all of these; nothing here adds a clock.
+    fn resource_concluded(
         delivered: Arc<AtomicBool>,
         on_delivered: Arc<dyn Fn() + Send + Sync + 'static>,
         on_outcome_failed: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
-        watch: &TransferWatch,
-    ) -> bool {
-        use reticulum_rust::resource::{AutoCompressOption, Resource, ResourceData, ResourceStatus};
-        if !link.is_active() {
-            return false;
-        }
-        let progress = watch.resource_progress(delivered.clone());
-        // The Resource's own RTT-scaled timeouts (RNS/Resource.py) decide the
-        // outcome; concluded with any status but COMPLETE is the failure.
-        let concluded: Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync> = Arc::new(move |resource| {
+    ) -> Arc<dyn Fn(Arc<Mutex<reticulum_rust::resource::Resource>>) + Send + Sync> {
+        use reticulum_rust::resource::ResourceStatus;
+        Arc::new(move |resource| {
             let complete = resource
                 .lock()
                 .map(|r| matches!(r.status, ResourceStatus::Complete))
@@ -2171,7 +2240,38 @@ impl AppLinks {
             } else if let Some(failed) = &on_outcome_failed {
                 failed();
             }
-        });
+        })
+    }
+
+    /// Send `packed` as a Resource on `link` (LXMF/LXMessage.py: a message
+    /// larger than the link MDU has the RESOURCE representation and is
+    /// delivered by `RNS.Resource(packed, link)`; `__resource_concluded`
+    /// marks it delivered when the status is COMPLETE). Until 2026-09-23
+    /// every direct message left here as ONE link packet, so anything over
+    /// the MDU never left the phone: the packet could not be built, the
+    /// receipt timed out, and the 5-second fallback propagated it instead.
+    ///
+    /// The Resource's progress callback (RNS/Resource.py `request` →
+    /// `progress_callback`, LXMF/LXMessage.py `__as_resource`) reports its
+    /// fraction to the caller and marks transfer activity for Timer P and
+    /// the outcome backstop (`TransferWatch::resource_progress`). Until
+    /// 2026-09-29 it was `None`: the message sat at 5 % for the whole
+    /// transfer and the timers took a moving transfer for a stuck one.
+    fn fire_resource_on_link(
+        link: &LinkHandle,
+        packed: &[u8],
+        compress: bool,
+        delivered: Arc<AtomicBool>,
+        on_delivered: Arc<dyn Fn() + Send + Sync + 'static>,
+        on_outcome_failed: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
+        watch: &TransferWatch,
+    ) -> bool {
+        use reticulum_rust::resource::{AutoCompressOption, Resource, ResourceData};
+        if !link.is_active() {
+            return false;
+        }
+        let progress = watch.resource_progress(delivered.clone());
+        let concluded = Self::resource_concluded(delivered, on_delivered, on_outcome_failed);
         match Resource::new_internal(
             Some(ResourceData::Bytes(packed.to_vec())),
             link.clone(),
@@ -2235,13 +2335,15 @@ pub const LIVENESS_CACHE_TTL: Duration = Duration::from_secs(2);
 /// (DESIGN_PRINCIPLES §1).  Late success past this point is a defect.
 const LIVENESS_BUDGET: Duration = Duration::from_secs(5);
 
-/// Backstop on the tier-3 outcome wait. The outcome itself comes from the
+/// Backstop on each fired tier's outcome wait (`AppLinks::await_tier`; until
+/// 2026-09-29 only tier 3 had one). The outcome itself comes from the
 /// stack's own RTT-scaled timeouts (packet receipt, Resource); this only
-/// guards against a lost callback and is never what decides a send.
-/// It counts only time with neither an outcome nor transfer activity
-/// (`AppLinks::await_outcome`): each report of more of a Resource sent
-/// restarts it. Until 2026-09-29 it counted from the fire, and failed a
-/// ~4-minute Bluetooth photo transfer at 120 s while it was still moving.
+/// guards against a lost callback and is never what decides a send or hands
+/// a tier over while its transfer moves. It counts only time with neither an
+/// outcome nor transfer activity (`AppLinks::await_outcome`): each report of
+/// more of a Resource sent restarts it. Until 2026-09-29 it counted from the
+/// fire, and failed a ~4-minute Bluetooth photo transfer at 120 s while it
+/// was still moving.
 const OUTCOME_BACKSTOP: Duration = Duration::from_secs(120);
 
 /// How long a send may go undelivered AND without transfer activity before
@@ -2255,9 +2357,10 @@ pub const PROP_FALLBACK_DELAY: Duration = LIVENESS_BUDGET;
 
 /// When one send's transfer last moved: the send's start, then each report
 /// from a Resource carrying it that more of it has been sent. Timer P and
-/// the tier-3 outcome backstop count from here, so they measure only time
+/// every tier's outcome backstop count from here, so they measure only time
 /// WITHOUT transfer activity — a transfer that is making progress is not
-/// stuck. Shared by every tier of the send.
+/// stuck. Shared by every tier of the send, so the quiet time runs on across
+/// the handover from a failed tier's Resource to the next tier's.
 #[derive(Clone)]
 struct TransferActivity {
     last: Arc<Mutex<Instant>>,
@@ -2295,10 +2398,11 @@ impl TransferWatch {
 
     /// The reporter for one Resource: called with the fraction
     /// `Resource::get_progress` gives after each request the receiver makes.
-    /// Until the send is delivered it hands the caller that raw fraction,
-    /// and marks transfer activity when this Resource's fraction has grown
-    /// (a request that only brings resends is not progress). After delivery
-    /// it does nothing.
+    /// Until `delivered` is set (the gate of the attempt this Resource
+    /// carries: in the tier chain, its tier's gate) it hands the caller that
+    /// raw fraction, and marks transfer activity when this Resource's
+    /// fraction has grown (a request that only brings resends is not
+    /// progress). After delivery it does nothing.
     fn reporter(&self, delivered: Arc<AtomicBool>) -> impl Fn(f64) + Send + Sync + 'static {
         let watch = self.clone();
         let reached = Mutex::new(0.0f64);
@@ -2340,7 +2444,7 @@ impl TransferWatch {
     }
 }
 
-/// How the tier-3 outcome wait ended (`AppLinks::await_outcome`).
+/// How one fired tier's outcome wait ended (`AppLinks::await_outcome`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutcomeWait {
     /// The delivery proof, or the Resource concluded COMPLETE.
@@ -2352,6 +2456,356 @@ enum OutcomeWait {
     Quiet,
     /// Every callback that could report was dropped without reporting.
     Dropped,
+}
+
+// ─── One DIRECT send: its tiers and its outcome ──────────────────────────
+
+/// The three tiers of a DIRECT send, in the order the chain tries them
+/// (see "Send tiers" at the top of this file).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tier {
+    /// Tier 1: the peer's own (inbound) link to us.
+    Inbound,
+    /// Tier 2: our cached outbound link from an earlier tier 3.
+    Cached,
+    /// Tier 3: a fresh path race and a new outbound link.
+    NewLink,
+}
+
+impl Tier {
+    fn index(self) -> usize {
+        match self {
+            Tier::Inbound => 0,
+            Tier::Cached => 1,
+            Tier::NewLink => 2,
+        }
+    }
+
+    fn number(self) -> usize {
+        self.index() + 1
+    }
+}
+
+/// The clocks of one tier chain. None of them decides whether a tier failed:
+/// that is always the tier's own event.
+#[derive(Debug, Clone, Copy)]
+struct ChainPacing {
+    /// A packet tier's head start before the next tier fires beside it
+    /// ([`DIRECT_STAGGER_WAIT`]). Resource tiers do not use it.
+    stagger: Duration,
+    /// Timer P: time undelivered and without transfer activity before
+    /// `on_propagation_needed` ([`PROP_FALLBACK_DELAY`], zero when the
+    /// destination is already DISCONNECTED).
+    prop_delay: Duration,
+    /// The lost-callback guard on each fired tier's outcome wait
+    /// ([`OUTCOME_BACKSTOP`]; quiet time only).
+    backstop: Duration,
+}
+
+/// One tier's line back to its send: the tier's link calls `delivered` or
+/// `failed` on the stack's own events for the message it carries.
+struct TierReport {
+    /// This tier's own gate: its link's delivery callbacks pass it once.
+    gate: Arc<AtomicBool>,
+    /// The send's delivered gate: set once any tier has delivered.
+    send_delivered: Arc<AtomicBool>,
+    /// This tier delivered: its link packet was proved, or its Resource
+    /// concluded COMPLETE.
+    delivered: Arc<dyn Fn() + Send + Sync + 'static>,
+    /// This tier's own failure event: its packet receipt timed out, or its
+    /// Resource concluded without COMPLETE.
+    failed: Arc<dyn Fn() + Send + Sync + 'static>,
+}
+
+/// How the tier chain reaches each tier's link: the stack's own links in
+/// production ([`StackTiers`]), fakes in the tests.
+trait TierLinks {
+    /// Put the message in flight on `tier`'s link, reporting that tier's own
+    /// outcome through `report`. Returns false when the tier has no usable
+    /// link or put nothing in flight (for tier 3: its path race or link
+    /// failed); `report` is then never called.
+    fn fire(&self, tier: Tier, report: TierReport, watch: &TransferWatch) -> bool;
+}
+
+/// The tiers on the stack's own links: the registry's inbound and cached
+/// outbound links, and tier 3's path race and new link (`run_tier3`).
+struct StackTiers<'a> {
+    dest: &'a [u8],
+    packed: &'a [u8],
+    compress: bool,
+}
+
+impl TierLinks for StackTiers<'_> {
+    fn fire(&self, tier: Tier, report: TierReport, watch: &TransferWatch) -> bool {
+        let dest = self.dest;
+        let (handle, which) = match tier {
+            Tier::NewLink => {
+                return AppLinks::run_tier3(dest, self.packed, self.compress, report, watch);
+            }
+            Tier::Inbound => (AppLinks::get_inbound_handle(dest), "inbound link"),
+            Tier::Cached => (
+                REGISTRY.lock().ok().and_then(|r| r.links.get(dest).cloned()),
+                "cached outbound link",
+            ),
+        };
+        let Some(handle) = handle.filter(|h| h.status() == STATE_ACTIVE) else {
+            return false;
+        };
+        let carried = match link_representation(self.packed.len()) {
+            LinkRepresentation::Packet => "packet",
+            LinkRepresentation::Resource => "Resource",
+        };
+        log(
+            &format!(
+                "[APP_LINK] send tier-{} ({}, {} of {} B) for {}",
+                tier.number(),
+                which,
+                carried,
+                self.packed.len(),
+                hexrep(dest, false)
+            ),
+            LOG_NOTICE, false, false,
+        );
+        let fired = AppLinks::fire_on_link(
+            &handle,
+            self.packed,
+            self.compress,
+            report.gate,
+            report.delivered,
+            Some(report.failed),
+            watch,
+        );
+        if !fired {
+            log(
+                &format!(
+                    "[APP_LINK] send tier-{}: the message could not be put in flight on the {} to {}",
+                    tier.number(),
+                    which,
+                    hexrep(dest, false)
+                ),
+                LOG_NOTICE, false, false,
+            );
+        }
+        fired
+    }
+}
+
+/// The one outcome of one DIRECT send, decided from its tiers' own events.
+///
+/// `on_delivered` fires once, from the first tier to deliver. `on_failed`
+/// fires once, when the chain will fire no more tiers and every tier that
+/// fired has failed — or no tier could fire. So neither a tier-3 setup
+/// failure nor a later tier's failure can fail a send whose earlier tier is
+/// still in flight. Whatever a tier reports after the outcome is logged and
+/// ignored. Until 2026-09-29 tiers 1 and 2 reported no failure at all and
+/// tier 3 alone decided `on_failed`.
+struct SendOutcome {
+    dest: Vec<u8>,
+    /// The send's delivered gate: Timer P and the chain read it.
+    delivered: Arc<AtomicBool>,
+    state: Mutex<OutcomeState>,
+    on_delivered: Arc<dyn Fn() + Send + Sync + 'static>,
+    on_failed: Arc<dyn Fn() + Send + Sync + 'static>,
+}
+
+#[derive(Default)]
+struct OutcomeState {
+    /// Tiers armed to fire, or fired, whose own outcome has not arrived.
+    in_flight: [bool; 3],
+    /// Tiers that fired and failed, in the order they failed.
+    failed: Vec<Tier>,
+    /// The chain will fire no more tiers.
+    exhausted: bool,
+    /// The send's outcome once decided: `true` delivered, `false` failed.
+    decided: Option<bool>,
+}
+
+impl OutcomeState {
+    /// Fail the send when nothing can still deliver it: the chain fires no
+    /// more tiers and no tier is in flight. Returns why, the once it does.
+    fn settle(&mut self) -> Option<String> {
+        if self.decided.is_some() || !self.exhausted || self.in_flight.iter().any(|t| *t) {
+            return None;
+        }
+        self.decided = Some(false);
+        if self.failed.is_empty() {
+            return Some("no tier could fire".to_string());
+        }
+        let tiers: Vec<String> = self.failed.iter().map(|t| t.number().to_string()).collect();
+        Some(format!("every tier that fired has failed (tier {})", tiers.join(", then ")))
+    }
+}
+
+fn outcome_word(delivered: bool) -> &'static str {
+    if delivered {
+        "delivered"
+    } else {
+        "failed"
+    }
+}
+
+impl SendOutcome {
+    fn new(
+        dest: &[u8],
+        on_delivered: Arc<dyn Fn() + Send + Sync + 'static>,
+        on_failed: Arc<dyn Fn() + Send + Sync + 'static>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            dest: dest.to_vec(),
+            delivered: Arc::new(AtomicBool::new(false)),
+            state: Mutex::new(OutcomeState::default()),
+            on_delivered,
+            on_failed,
+        })
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, OutcomeState> {
+        self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// `tier` is about to fire. It counts as in flight from now until its own
+    /// outcome arrives (or [`Self::not_fired`]), so an outcome it reports
+    /// while still being fired already counts. Returns the tier's report and
+    /// the channel the chain hears its outcome on.
+    fn arm(self: &Arc<Self>, tier: Tier) -> (TierReport, std::sync::mpsc::Receiver<bool>) {
+        self.state().in_flight[tier.index()] = true;
+        let (tx, rx) = std::sync::mpsc::sync_channel::<bool>(2);
+        let this = self.clone();
+        let delivered_tx = tx.clone();
+        let delivered: Arc<dyn Fn() + Send + Sync + 'static> = Arc::new(move || {
+            this.tier_delivered(tier);
+            let _ = delivered_tx.try_send(true);
+        });
+        let this = self.clone();
+        let failed: Arc<dyn Fn() + Send + Sync + 'static> = Arc::new(move || {
+            this.tier_failed(
+                tier,
+                "the stack reported delivery failed (packet receipt timed out, or its Resource concluded without COMPLETE)",
+            );
+            let _ = tx.try_send(false);
+        });
+        let report = TierReport {
+            gate: Arc::new(AtomicBool::new(false)),
+            send_delivered: self.delivered.clone(),
+            delivered,
+            failed,
+        };
+        (report, rx)
+    }
+
+    /// `tier` had no usable link, or put nothing in flight.
+    fn not_fired(&self, tier: Tier) {
+        let failed = {
+            let mut state = self.state();
+            state.in_flight[tier.index()] = false;
+            state.settle()
+        };
+        if let Some(why) = failed {
+            self.fail(why);
+        }
+    }
+
+    /// The chain fires no more tiers.
+    fn exhausted(&self) {
+        let failed = {
+            let mut state = self.state();
+            state.exhausted = true;
+            state.settle()
+        };
+        if let Some(why) = failed {
+            self.fail(why);
+        }
+    }
+
+    fn is_decided(&self) -> bool {
+        self.state().decided.is_some()
+    }
+
+    /// `tier` delivered: the send is delivered, unless it already had its
+    /// outcome.
+    fn tier_delivered(&self, tier: Tier) {
+        let first = {
+            let mut state = self.state();
+            state.in_flight[tier.index()] = false;
+            match state.decided {
+                None => {
+                    state.decided = Some(true);
+                    true
+                }
+                Some(earlier) => {
+                    log(
+                        &format!(
+                            "[APP_LINK] send tier-{} delivered after the send had already {} for {}; ignored",
+                            tier.number(),
+                            outcome_word(earlier),
+                            hexrep(&self.dest, false)
+                        ),
+                        LOG_NOTICE, false, false,
+                    );
+                    false
+                }
+            }
+        };
+        if first {
+            self.delivered.store(true, Ordering::Release);
+            log(
+                &format!("[APP_LINK] send delivered via tier-{} for {}", tier.number(), hexrep(&self.dest, false)),
+                LOG_NOTICE, false, false,
+            );
+            (self.on_delivered)();
+        }
+    }
+
+    /// `tier`'s own failure event (or its outcome wait's backstop). Fails the
+    /// send when it was the last tier that could still deliver it.
+    fn tier_failed(&self, tier: Tier, why: &str) {
+        let failed = {
+            let mut state = self.state();
+            if !state.in_flight[tier.index()] {
+                log(
+                    &format!(
+                        "[APP_LINK] send tier-{}: {} after its outcome was already in for {}; ignored",
+                        tier.number(),
+                        why,
+                        hexrep(&self.dest, false)
+                    ),
+                    LOG_NOTICE, false, false,
+                );
+                return;
+            }
+            state.in_flight[tier.index()] = false;
+            if let Some(earlier) = state.decided {
+                log(
+                    &format!(
+                        "[APP_LINK] send tier-{} failed after the send had already {} for {}: {}; ignored",
+                        tier.number(),
+                        outcome_word(earlier),
+                        hexrep(&self.dest, false),
+                        why
+                    ),
+                    LOG_NOTICE, false, false,
+                );
+                return;
+            }
+            state.failed.push(tier);
+            log(
+                &format!("[APP_LINK] send tier-{} failed for {}: {}", tier.number(), hexrep(&self.dest, false), why),
+                LOG_NOTICE, false, false,
+            );
+            state.settle()
+        };
+        if let Some(why) = failed {
+            self.fail(why);
+        }
+    }
+
+    fn fail(&self, why: String) {
+        log(
+            &format!("[APP_LINK] send failed for {}: {}", hexrep(&self.dest, false), why),
+            LOG_NOTICE, false, false,
+        );
+        (self.on_failed)();
+    }
 }
 
 /// Polling interval while waiting for a path to populate after firing
@@ -2564,9 +3018,20 @@ impl AppLinks {
 //   §O6 A Resource's progress reaches the caller until delivery, and marks
 //       transfer activity when more of it has been sent.
 //   §O7 A transfer that keeps moving gets no Timer P backup and is not
-//       failed by the tier-3 backstop; a silent one gets both.
+//       failed by the outcome backstop; a silent one gets both.
+//   §O8 A tier carrying a Resource hands over to the next tier only on its
+//       own failure event (its Resource concluding FAILED, which covers its
+//       link closing and an advertisement nobody answers), never on the
+//       stagger; a tier carrying one packet keeps the DIRECT_STAGGER_WAIT
+//       stagger.
+//   §O9 One outcome per send: on_delivered once, from the first tier to
+//       deliver; on_failed once, only after every tier that fired has
+//       failed (a tier-3 setup failure never fails a send with a tier still
+//       in flight); anything later is ignored.
 //
-// All tests use short delays (ms) so the suite completes quickly.
+// §O8/§O9 drive the production tier chain (`drive_tier_chain`) over fake
+// links (`FakeTiers`); §O8's advertisement case runs a real Resource's own
+// watchdog. All tests use short delays (ms) so the suite completes quickly.
 
 #[cfg(test)]
 mod tests {
@@ -2949,8 +3414,6 @@ mod tests {
         );
     }
 
-    // §O5 — Tier-1 delivery is still accepted after tier-2 has started.
-    // The delivered gate must remain open to any tier at any time.
     #[test]
     fn a_message_over_the_link_mdu_travels_as_a_resource() {
         use super::{link_representation, LinkRepresentation};
@@ -2961,6 +3424,8 @@ mod tests {
         assert_eq!(link_representation(1700), LinkRepresentation::Resource);
     }
 
+    // §O5 — Tier-1 delivery is still accepted after tier-2 has started.
+    // The delivered gate must remain open to any tier at any time.
     #[test]
     fn tier1_delivery_accepted_after_tier2_starts() {
         let delivered = Arc::new(AtomicBool::new(false));
@@ -3151,6 +3616,21 @@ mod tests {
             !fragment.contains("spawn_after(\n                \"app_links_tier2\""),
             "tier scheduling must not rely on detached fixed-delay worker threads"
         );
+        // §O8: the stagger is for packets. A Resource tier is heard to its
+        // own outcome instead, before the next tier may fire.
+        for (tier, rx) in [("Inbound", "tier1_rx"), ("Cached", "tier2_rx")] {
+            let branch = fragment
+                .split(&format!("Self::await_tier(outcome, Tier::{}, &{}, &watch, pacing.backstop)", tier, rx))
+                .next()
+                .expect("tier branch");
+            let resource_branch = branch.rfind("if resource {").expect("each staggered tier branches on the representation");
+            assert!(
+                !branch[resource_branch..].contains("sleep("),
+                "tier {} must not sleep the stagger before hearing its Resource's outcome",
+                tier
+            );
+        }
+        assert_eq!(fragment.matches("std::thread::sleep(pacing.stagger);").count(), 2, "Timer A and Timer B only");
     }
 
     #[test]
@@ -3508,9 +3988,18 @@ mod tests {
         assert_eq!(chain.matches("&watch,\n").count(), 3, "tiers 1, 2 and 3 share the watch");
         assert!(!chain.contains("spawn_after("), "Timer P is not a fixed-delay one-shot");
 
+        // Every fired tier's outcome wait (tier 3's included) counts quiet
+        // time only, with production's OUTCOME_BACKSTOP.
         let tier3 = between("fn run_tier3(", "fn await_outcome(");
-        assert!(tier3.contains("Self::await_outcome(&outcome_rx, &watch.activity, OUTCOME_BACKSTOP)"));
         assert!(!tier3.contains("recv_timeout(OUTCOME_BACKSTOP)"), "the backstop counts quiet time only");
+        let wait = between("fn await_tier(", "fn await_outcome(");
+        assert!(wait.contains("Self::await_outcome(rx, &watch.activity, backstop)"));
+        assert!(chain.contains("backstop: OUTCOME_BACKSTOP,"));
+        assert_eq!(
+            chain.matches("Self::await_tier(outcome, ").count(),
+            4,
+            "tiers 1 and 2 (as Resources), tier 3, and the packet tiers still unheard are all heard under it"
+        );
 
         let held = between("pub fn send_on_held_link(", "pub fn status(");
         assert!(held.contains("let watch = TransferWatch::new(on_progress);"));
@@ -3518,5 +4007,383 @@ mod tests {
 
         let send = between("pub fn send_with_compression(", "pub fn send_with_spec(");
         assert!(send.contains("on_progress,\n                );"), "the caller's callback reaches the tier chain");
+    }
+
+    // ── §O8/§O9: the production tier chain, over fake links ─────────────
+
+    /// What one fake tier does when the chain fires it: put its message in
+    /// flight and report through `report` later (true), or put nothing in
+    /// flight (false: tier 3's path race or link failed).
+    type FakeFire = Box<dyn Fn(TierReport, &TransferWatch) -> bool + Send + Sync>;
+
+    /// The chain's links, faked. A tier that is `None` has no link. Records
+    /// when the chain asked each tier to fire.
+    struct FakeTiers {
+        started: Instant,
+        tiers: [Option<FakeFire>; 3],
+        asked: Mutex<Vec<(Tier, Duration)>>,
+    }
+
+    impl FakeTiers {
+        fn new(tier1: Option<FakeFire>, tier2: Option<FakeFire>, tier3: Option<FakeFire>) -> Self {
+            Self { started: Instant::now(), tiers: [tier1, tier2, tier3], asked: Mutex::new(Vec::new()) }
+        }
+
+        fn asked(&self) -> Vec<Tier> {
+            self.asked.lock().unwrap().iter().map(|(tier, _)| *tier).collect()
+        }
+
+        fn asked_at(&self, tier: Tier) -> Option<Duration> {
+            self.asked.lock().unwrap().iter().find(|(t, _)| *t == tier).map(|(_, at)| *at)
+        }
+    }
+
+    impl TierLinks for FakeTiers {
+        fn fire(&self, tier: Tier, report: TierReport, watch: &TransferWatch) -> bool {
+            self.asked.lock().unwrap().push((tier, self.started.elapsed()));
+            match &self.tiers[tier.index()] {
+                Some(fire) => fire(report, watch),
+                None => false,
+            }
+        }
+    }
+
+    /// What the caller of one send heard, and when (from `FakeTiers::started`).
+    #[derive(Default, Debug)]
+    struct Heard {
+        delivered: Vec<Duration>,
+        failed: Vec<Duration>,
+        propagation: Vec<Duration>,
+    }
+
+    /// Test clocks: a 50 ms packet stagger, Timer P out of the way, and a
+    /// backstop no test reaches: the tiers' own events decide everything.
+    fn test_pacing() -> ChainPacing {
+        ChainPacing {
+            stagger: Duration::from_millis(50),
+            prop_delay: Duration::from_secs(30),
+            backstop: Duration::from_secs(10),
+        }
+    }
+
+    /// Run the production tier chain over `links` on this thread, as the send
+    /// thread does, and return what the caller heard. Keeps listening for
+    /// `linger` after the chain returns, for anything a tier reports late.
+    fn drive(
+        links: &FakeTiers,
+        representation: LinkRepresentation,
+        pacing: ChainPacing,
+        linger: Duration,
+    ) -> Heard {
+        let heard = Arc::new(Mutex::new(Heard::default()));
+        let started = links.started;
+        let (delivered, failed, propagation) = (heard.clone(), heard.clone(), heard.clone());
+        let outcome = SendOutcome::new(
+            b"fake-peer",
+            Arc::new(move || delivered.lock().unwrap().delivered.push(started.elapsed())),
+            Arc::new(move || failed.lock().unwrap().failed.push(started.elapsed())),
+        );
+        AppLinks::drive_tier_chain(
+            links,
+            representation,
+            pacing,
+            &outcome,
+            Arc::new(move || propagation.lock().unwrap().propagation.push(started.elapsed())),
+            None,
+        );
+        std::thread::sleep(linger);
+        let heard = std::mem::take(&mut *heard.lock().unwrap());
+        heard
+    }
+
+    /// A tier whose Resource goes out and then, on its own thread, reports
+    /// `steps` rising fractions `every` apart through the production
+    /// reporter (as the stack's `request` does), and concludes: delivered, or
+    /// its own failure event.
+    fn moving(steps: usize, every: Duration, delivers: bool) -> Option<FakeFire> {
+        Some(Box::new(move |report: TierReport, watch: &TransferWatch| {
+            let progress = watch.reporter(report.gate.clone());
+            std::thread::spawn(move || {
+                feed_progress(progress, steps, every);
+                if delivers { (report.delivered)() } else { (report.failed)() }
+            });
+            true
+        }))
+    }
+
+    /// A tier whose message goes out and concludes `after`, with no progress
+    /// on the way: a link packet's receipt, or a Resource nobody requests.
+    fn silent(after: Duration, delivers: bool) -> Option<FakeFire> {
+        Some(Box::new(move |report: TierReport, _: &TransferWatch| {
+            std::thread::spawn(move || {
+                std::thread::sleep(after);
+                if delivers { (report.delivered)() } else { (report.failed)() }
+            });
+            true
+        }))
+    }
+
+    /// Tier 3 whose path race or link establishment fails: nothing goes out.
+    fn setup_fails() -> Option<FakeFire> {
+        Some(Box::new(|_: TierReport, _: &TransferWatch| false))
+    }
+
+    fn unix_now() -> f64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64()
+    }
+
+    // §O8 (1) — a Resource moving on tier 1 is left to finish. However long
+    // it runs against the stagger, tiers 2 and 3 are never fired (both have
+    // links and would deliver at once), and delivery is heard once. Until
+    // 2026-09-29 tier 2 fired its own full copy one stagger in.
+    #[test]
+    fn a_moving_resource_on_tier_1_gets_no_second_or_third_copy() {
+        let links = FakeTiers::new(
+            moving(30, Duration::from_millis(10), true),
+            silent(Duration::ZERO, true),
+            silent(Duration::ZERO, true),
+        );
+        let heard = drive(&links, LinkRepresentation::Resource, test_pacing(), Duration::from_millis(100));
+        assert_eq!(links.asked(), vec![Tier::Inbound], "a moving Resource must not get a second copy: {:?}", heard);
+        assert_eq!(heard.delivered.len(), 1, "delivered once: {:?}", heard);
+        assert!(heard.delivered[0] >= Duration::from_millis(300), "by tier 1, when its Resource completed: {:?}", heard);
+        assert!(heard.failed.is_empty(), "{:?}", heard);
+    }
+
+    // §O8 (2) — tier 1's Resource fails: tier 2 fires then, on that failure
+    // event, and not when the stagger passes.
+    #[test]
+    fn a_failed_resource_hands_over_at_its_failure_not_at_the_stagger() {
+        let pacing = test_pacing();
+        let fails_at = Duration::from_millis(250);
+        let links = FakeTiers::new(
+            silent(fails_at, false),
+            moving(5, Duration::from_millis(10), true),
+            silent(Duration::ZERO, true),
+        );
+        let heard = drive(&links, LinkRepresentation::Resource, pacing, Duration::from_millis(100));
+        let tier2 = links.asked_at(Tier::Cached).expect("tier 2 fires once tier 1's Resource has failed");
+        assert!(
+            tier2 >= fails_at,
+            "tier 2 fired at {:?}, before tier 1's Resource failed at {:?} (the stagger is {:?})",
+            tier2, fails_at, pacing.stagger
+        );
+        assert!(
+            tier2 < fails_at * 2,
+            "tier 2 fired at {:?}: at tier 1's failure event, not on the backstop ({:?})",
+            tier2, pacing.backstop
+        );
+        assert_eq!(links.asked(), vec![Tier::Inbound, Tier::Cached], "tier 2 delivered: no tier 3");
+        assert_eq!(heard.delivered.len(), 1, "{:?}", heard);
+        assert!(heard.failed.is_empty(), "tier 1's failure alone does not fail the send: {:?}", heard);
+    }
+
+    // §O9 (3) — every tier that fired fails, one after another: on_failed
+    // once, only after the last of them, and nothing a tier reports after
+    // that (a second failure, a late delivery) reaches the caller.
+    #[test]
+    fn on_failed_fires_once_after_the_last_fired_tier_fails() {
+        let step = Duration::from_millis(80);
+        let then_late: Option<FakeFire> = Some(Box::new(move |report: TierReport, _: &TransferWatch| {
+            std::thread::spawn(move || {
+                std::thread::sleep(step);
+                (report.failed)();
+                std::thread::sleep(Duration::from_millis(30));
+                (report.failed)();
+                (report.delivered)();
+            });
+            true
+        }));
+        let links = FakeTiers::new(silent(step, false), silent(step, false), then_late);
+        let heard = drive(&links, LinkRepresentation::Resource, test_pacing(), Duration::from_millis(150));
+        assert_eq!(links.asked(), vec![Tier::Inbound, Tier::Cached, Tier::NewLink]);
+        assert!(links.asked_at(Tier::NewLink).unwrap() >= step * 2, "each tier fired on the failure of the one before");
+        assert_eq!(heard.failed.len(), 1, "on_failed exactly once: {:?}", heard);
+        assert!(heard.failed[0] >= step * 3, "only after tier 3, the last, failed: {:?}", heard);
+        assert!(heard.delivered.is_empty(), "a delivery reported after the send failed is ignored: {:?}", heard);
+    }
+
+    // §O9 (3), packets — the tiers' packets are in flight together, so the
+    // last to fail may be an early tier: on_failed waits for it. Until
+    // 2026-09-29 tier 3's setup failure alone failed the send.
+    #[test]
+    fn a_packet_send_fails_only_after_its_last_outstanding_tier_fails() {
+        let tier1_times_out = Duration::from_millis(400);
+        let links = FakeTiers::new(
+            silent(tier1_times_out, false),
+            silent(Duration::from_millis(60), false),
+            setup_fails(),
+        );
+        let heard = drive(&links, LinkRepresentation::Packet, test_pacing(), Duration::from_millis(100));
+        assert_eq!(links.asked(), vec![Tier::Inbound, Tier::Cached, Tier::NewLink]);
+        assert!(links.asked_at(Tier::NewLink).unwrap() < tier1_times_out);
+        assert_eq!(heard.failed.len(), 1, "{:?}", heard);
+        assert!(heard.failed[0] >= tier1_times_out, "not before tier 1's receipt timed out: {:?}", heard);
+        assert!(heard.delivered.is_empty(), "{:?}", heard);
+    }
+
+    // §O9 (4) — tier 3 cannot set up (its path race or link fails) while
+    // tier 1's Resource is moving: tier 3 is not even tried while it moves,
+    // the send is not failed, and tier 1 delivers. Until 2026-09-29 tier 3
+    // ran beside the moving Resource and its setup failure FAILED the
+    // message.
+    #[test]
+    fn a_tier_3_setup_failure_cannot_fail_a_moving_tier_1_resource() {
+        let links = FakeTiers::new(moving(30, Duration::from_millis(10), true), None, setup_fails());
+        let heard = drive(&links, LinkRepresentation::Resource, test_pacing(), Duration::from_millis(100));
+        assert_eq!(links.asked(), vec![Tier::Inbound], "{:?}", heard);
+        assert!(heard.failed.is_empty(), "{:?}", heard);
+        assert_eq!(heard.delivered.len(), 1, "{:?}", heard);
+    }
+
+    // §O9 (4), packets — tier 3 does run beside a packet still in flight on
+    // tier 1; its setup failure leaves the send to tier 1's own outcome.
+    #[test]
+    fn a_tier_3_setup_failure_leaves_an_outstanding_tier_1_packet_to_deliver() {
+        let delivers_at = Duration::from_millis(250);
+        let links = FakeTiers::new(silent(delivers_at, true), None, setup_fails());
+        let heard = drive(&links, LinkRepresentation::Packet, test_pacing(), Duration::from_millis(100));
+        assert_eq!(links.asked(), vec![Tier::Inbound, Tier::Cached, Tier::NewLink]);
+        assert!(
+            links.asked_at(Tier::NewLink).unwrap() < delivers_at,
+            "tier 3's setup failed while tier 1's packet was in flight"
+        );
+        assert!(heard.failed.is_empty(), "{:?}", heard);
+        assert_eq!(heard.delivered.len(), 1, "{:?}", heard);
+        assert!(heard.delivered[0] >= delivers_at, "{:?}", heard);
+    }
+
+    // §O8 (5) — the receiver never starts the transfer: nobody answers tier
+    // 1's advertisement. The Resource's own watchdog fails it when its last
+    // advertisement goes unanswered (RNS/Resource.py: ADVERTISED past
+    // adv_sent + timeout + PROCESSING_GRACE with no retries left → cancel →
+    // FAILED → callback), and that is when tier 2 fires. The real watchdog
+    // runs here, with the production conclusion callback; the Resource starts
+    // on its last advertisement (retries_left 0) so the test takes one
+    // PROCESSING_GRACE rather than MAX_ADV_RETRIES + 1 of them.
+    #[test]
+    fn an_advertisement_nobody_answers_hands_over_on_the_resources_own_failure() {
+        use reticulum_rust::resource::{Resource, ResourceStatus};
+        let built: Arc<Mutex<Option<Arc<Mutex<Resource>>>>> = Arc::new(Mutex::new(None));
+        let built_by_tier1 = built.clone();
+        let advertised: Option<FakeFire> = Some(Box::new(move |report: TierReport, watch: &TransferWatch| {
+            let mut resource = sending_resource(8, watch.resource_progress(report.gate.clone()));
+            resource.callback = Some(AppLinks::resource_concluded(
+                report.gate.clone(),
+                report.delivered.clone(),
+                Some(report.failed.clone()),
+            ));
+            resource.status = ResourceStatus::Advertised;
+            resource.adv_sent = unix_now();
+            resource.retries_left = 0;
+            let resource = Arc::new(Mutex::new(resource));
+            *built_by_tier1.lock().unwrap() = Some(resource.clone());
+            Resource::start_watchdog(resource);
+            true
+        }));
+        let links = FakeTiers::new(advertised, silent(Duration::ZERO, true), None);
+        let heard = drive(&links, LinkRepresentation::Resource, test_pacing(), Duration::from_millis(50));
+
+        let grace = Duration::from_secs_f64(Resource::PROCESSING_GRACE);
+        let tier2 = links.asked_at(Tier::Cached).expect("tier 2 fires on tier 1's advertisement failure");
+        assert!(
+            tier2 + Duration::from_millis(20) >= grace,
+            "tier 2 fired at {:?}, before tier 1's advertisement could go unanswered ({:?})",
+            tier2, grace
+        );
+        assert!(
+            tier2 < grace * 2,
+            "tier 2 fired at {:?}: on the Resource's own failure, not on the chain's backstop ({:?})",
+            tier2, test_pacing().backstop
+        );
+        let resource = built.lock().unwrap().clone().expect("tier 1 built its Resource");
+        let resource = resource.lock().unwrap();
+        assert_eq!(resource.status, ResourceStatus::Failed, "failed by its own watchdog");
+        assert_ne!(
+            resource.link.status(),
+            reticulum_rust::link::STATE_CLOSED,
+            "the advertisement failed, not the link: it is still open"
+        );
+        assert_eq!(heard.delivered.len(), 1, "tier 2 delivered: {:?}", heard);
+        assert!(heard.failed.is_empty(), "{:?}", heard);
+    }
+
+    // §O8 (6) — a message that fits one link packet keeps the stagger as it
+    // was: tier 2 fires one stagger after tier 1 even though tier 1's receipt
+    // has already timed out, tier 3 one stagger later, and the earlier
+    // packets stay in flight (tier 2's proof, after tier 3's, is ignored).
+    #[test]
+    fn packet_payloads_keep_the_stagger() {
+        let pacing = ChainPacing { stagger: Duration::from_millis(100), ..test_pacing() };
+        let links = FakeTiers::new(
+            silent(Duration::from_millis(10), false),
+            silent(Duration::from_millis(300), true),
+            silent(Duration::from_millis(20), true),
+        );
+        let heard = drive(&links, LinkRepresentation::Packet, pacing, Duration::from_millis(250));
+        let tier2 = links.asked_at(Tier::Cached).unwrap();
+        let tier3 = links.asked_at(Tier::NewLink).unwrap();
+        assert!(
+            tier2 >= pacing.stagger && tier2 < pacing.stagger * 2,
+            "tier 2 at {:?}: one stagger after tier 1, not at tier 1's failure (10 ms)",
+            tier2
+        );
+        assert!(tier3 >= pacing.stagger * 2 && tier3 < pacing.stagger * 3, "tier 3 at {:?}", tier3);
+        assert_eq!(heard.delivered.len(), 1, "{:?}", heard);
+        assert!(heard.delivered[0] >= tier3, "by tier 3's proof: {:?}", heard);
+        assert!(heard.failed.is_empty(), "{:?}", heard);
+    }
+
+    // §O9 (7) — Timer P counts only quiet time across the whole chain: a
+    // Resource that moves on tier 1, fails, and moves on tier 2 until it
+    // delivers is never quiet for Timer P's delay, however long it all
+    // takes, so it gets no propagated copy.
+    #[test]
+    fn timer_p_sees_one_transfer_across_a_tier_handover() {
+        let pacing = ChainPacing { prop_delay: Duration::from_millis(100), ..test_pacing() };
+        let links = FakeTiers::new(
+            moving(20, Duration::from_millis(10), false),
+            moving(20, Duration::from_millis(10), true),
+            None,
+        );
+        let heard = drive(&links, LinkRepresentation::Resource, pacing, pacing.prop_delay * 2);
+        assert_eq!(heard.delivered.len(), 1, "{:?}", heard);
+        assert!(heard.delivered[0] >= pacing.prop_delay * 4, "the transfer outlasted Timer P's delay: {:?}", heard);
+        assert!(
+            heard.propagation.is_empty(),
+            "the transfer never went {:?} without moving: {:?}",
+            pacing.prop_delay, heard
+        );
+    }
+
+    // §O9 (7) — and the quiet time runs on across a handover: tier 1's
+    // Resource stops moving and only fails later. Timer P fires one delay
+    // after its last progress, while the chain is still on tier 1.
+    #[test]
+    fn timer_p_fires_on_quiet_time_across_a_tier_handover() {
+        let pacing = ChainPacing { prop_delay: Duration::from_millis(100), ..test_pacing() };
+        let stalls: Option<FakeFire> = Some(Box::new(|report: TierReport, watch: &TransferWatch| {
+            let progress = watch.reporter(report.gate.clone());
+            std::thread::spawn(move || {
+                feed_progress(progress, 10, Duration::from_millis(10));
+                std::thread::sleep(Duration::from_millis(250));
+                (report.failed)();
+            });
+            true
+        }));
+        let links = FakeTiers::new(stalls, moving(5, Duration::from_millis(10), true), None);
+        let heard = drive(&links, LinkRepresentation::Resource, pacing, Duration::ZERO);
+        let tier2 = links.asked_at(Tier::Cached).expect("tier 2 fires once tier 1 fails");
+        assert_eq!(heard.propagation.len(), 1, "{:?}", heard);
+        assert!(
+            heard.propagation[0] >= Duration::from_millis(100) + pacing.prop_delay,
+            "a full delay after tier 1's last progress: {:?}",
+            heard
+        );
+        assert!(heard.propagation[0] < tier2, "while the chain was still on tier 1 (tier 2 at {:?}): {:?}", tier2, heard);
+        assert_eq!(heard.delivered.len(), 1, "{:?}", heard);
     }
 }

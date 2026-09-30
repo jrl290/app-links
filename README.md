@@ -38,14 +38,39 @@ For direct LXMF delivery, AppLinks acts as a send orchestrator.
 
 - It owns the three-tier DIRECT send flow: inbound link, cached outbound link,
 	then fresh outbound link.
+- How one tier hands over to the next depends on the message's size:
+	- A message that fits one link packet: each tier fires, and the next
+		fires `DIRECT_STAGGER_WAIT` (1 s) later unless the send has been
+		delivered by then. The earlier packet stays in flight.
+	- A message over the link MDU travels as a Resource. Each tier's Resource
+		runs to its own outcome, and the next tier fires only on that tier's own
+		failure event. That means the Resource concluding without COMPLETE,
+		which is also how it ends when its link closes or when the receiver
+		never answers its advertisement (RNS 1.5.2 `Resource.py`: the watchdog
+		gives up after `MAX_ADV_RETRIES`). No clock hands a tier over. A
+		Resource queued behind another transfer on its link waits its turn, as
+		the reference does.
+	- Since 2026-09-29. Before that, Resource tiers staggered by 1 s like
+		packets, so a photo went out two or three times at once. On the iPad over
+		the Bluetooth RTNode link it ran as two concurrent 3700-part Resources,
+		each at half speed. Tiers 1 and 2 also reported no failure, so a tier-3
+		path race or link that failed FAILED the message while tier 1's
+		Resource was still moving.
+- A send has one outcome. `on_delivered` fires once, from whichever tier
+	delivers first. `on_failed` fires once, only when no tier is left to fire
+	and every tier that fired has failed (or no tier could fire). Anything a
+	tier reports after the outcome is logged and ignored.
 - It tracks inbound delivery links opened by peers so later sends can reuse
 	them as the first tier.
 - It owns the 5-second propagation fallback trigger (Timer P) used when direct
 	delivery has not completed. The 5 seconds count only time without transfer
 	activity: a message over the link MDU travels as a Resource, and each
 	request the receiver makes that brings more of it sent starts them again,
-	so a transfer that is moving gets no propagated backup copy. The tier-3
-	outcome backstop (120 s) counts the same way.
+	so a transfer that is moving gets no propagated backup copy. The activity
+	clock is shared across the tiers, so a Resource that fails on one tier and
+	moves on the next is one transfer to Timer P. Each fired tier's outcome
+	backstop (120 s) counts the same way. It only guards a lost callback and
+	never hands over a moving transfer.
 - It reports a Resource transfer's progress to the caller
 	(`send_with_compression` / `send_on_held_link`, `SendProgressCallback`):
 	the raw `Resource::get_progress` fraction after each request served, until
