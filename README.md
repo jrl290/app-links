@@ -84,14 +84,17 @@ For direct LXMF delivery, AppLinks acts as a send orchestrator.
 	went too once its turn came. That change also swallowed a delivery that
 	came after `on_failed`, so a message the peer had proved stayed FAILED.
 	Both were fixed the same evening.
-- It reports a Resource transfer's progress to the caller
-	(`send_with_compression` / `send_on_held_link`, `SendProgressCallback`):
-	the raw `Resource::get_progress` fraction after each request served, until
-	delivery, and 0.0 once the Resource's advertisement has gone out. A
-	message that fits one link packet reports nothing. The advertisement
-	report starts LXMF's §1 watch on the transfer (DESIGN_PRINCIPLES §1, bulk
-	transfers: from the advertisement on, progress at least every 5 s; total
-	time is not measured). It is not transfer activity for Timer P.
+- It reports each Resource transfer to the caller
+	(`send_with_compression` / `send_on_held_link`, `SendProgressCallback`,
+	`SendProgress`): `Advertised` once its advertisement has gone out, the raw
+	`Resource::get_progress` fraction after each request served until
+	delivery, and `Ended` when it concludes without delivering, before its
+	tier's failure is reported. A message that fits one link packet reports
+	nothing. LXMF's §1 watch runs on each Resource from its advertisement to
+	its end (DESIGN_PRINCIPLES §1, bulk transfers: from the advertisement on,
+	progress at least every 5 s; total time is not measured), so a tier
+	handover's path race and link setup are not counted as a silent
+	transfer. Neither report is transfer activity for Timer P.
 
 In other words, for direct LXMF delivery AppLinks is not just keeping a link
 alive. It decides how the send is attempted and which link path is used.

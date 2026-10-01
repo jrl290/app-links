@@ -125,13 +125,15 @@
 //! came after `on_failed`, so a message the peer had proved stayed FAILED.
 //!
 //! `send_with_compression` and `send_on_held_link` take an optional progress
-//! callback that hears the Resource's own fraction (`Resource::get_progress`,
-//! RNS/Resource.py `get_progress`) after each request the receiver makes,
-//! until delivery, and 0.0 once its advertisement has gone out.  A payload
-//! that fits one link packet reports nothing.  The advertisement report is
-//! for DESIGN_PRINCIPLES §1, bulk transfers: from the advertisement on, a
-//! Resource must show progress at least every 5 s, and LXMF's send
-//! assertion watches that from these reports (since 2026-10-01).
+//! callback ([`SendProgress`]) that hears, for each Resource carrying the
+//! send: its advertisement once it has gone out, its own fraction
+//! (`Resource::get_progress`, RNS/Resource.py `get_progress`) after each
+//! request the receiver makes, until delivery, and its end when it concludes
+//! without delivering.  A payload that fits one link packet reports nothing.
+//! The advertisement and the end are for DESIGN_PRINCIPLES §1, bulk
+//! transfers: from its advertisement on, a Resource must show progress at
+//! least every 5 s, and LXMF's send assertion watches each Resource from its
+//! advertisement to its end from these reports (since 2026-10-01).
 //!
 //! Advancing to the next tier NEVER cancels or closes the packet or Resource
 //! of an earlier tier.
@@ -248,25 +250,46 @@ pub type InboundPacketCallback =
 /// has been wired via [`AppLinks::wire_inbound_destination`].
 pub type InboundLinkEstablishedCallback = Arc<dyn Fn() + Send + Sync + 'static>;
 
-/// Transfer progress of a send that travels as a Resource: the raw fraction
-/// (0.0..=1.0) the sending Resource reports through `Resource::get_progress`
-/// (RNS/Resource.py `get_progress`), called after each request the receiver
-/// makes, until the send is delivered.  The caller maps it onto its own
-/// scale (LXMF: 0.10 + 0.90 × fraction, LXMF/LXMessage.py
-/// `__update_transfer_progress`).  When one tier's Resource fails and the
-/// next tier's starts, the fraction starts again from that Resource's own
-/// beginning, so the values need not rise monotonically.  A send that fits
-/// one link packet reports nothing.
-/// Each Resource also reports 0.0 once, when its advertisement has gone
-/// out (after any wait behind another Resource on its link): every call is
-/// an event of the transfer, the advertisement or a request served, and
-/// LXMF's §1 send assertion counts the silence between them
-/// (DESIGN_PRINCIPLES §1, bulk transfers).  On a fast link that report can
-/// come after the first request's.
-/// Keep it short: it runs on the thread serving the receiver's request,
-/// with that Resource's lock held (the advertisement report: on the
-/// advertise thread, with no lock held), and must never wait on the link.
-pub type SendProgressCallback = Arc<dyn Fn(f64) + Send + Sync + 'static>;
+/// What a Resource carrying a send reports to the caller
+/// ([`SendProgressCallback`]).  Each is an event of that Resource's transfer.
+/// LXMF's §1 send assertion watches each Resource from its `Advertised` to
+/// its `Ended` (or the delivery), and counts the silence between its events
+/// (DESIGN_PRINCIPLES §1, bulk transfers: progress at least every 5 s from
+/// the advertisement on; total time is not measured).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SendProgress {
+    /// Its advertisement has gone out, after any wait behind another
+    /// Resource on its link (`Resource::advertise_shared_then`).  Once per
+    /// Resource, and never after its `Ended`.  The fraction then is 0.0,
+    /// where LXMF/LXMessage.py puts a Resource send at 0.10.  On a fast link
+    /// it can come after the first request's `Fraction`.  Not transfer
+    /// activity for Timer P: nothing of the message has been sent yet.
+    Advertised,
+    /// It served a request of the receiver's: the raw fraction (0.0..=1.0)
+    /// `Resource::get_progress` gives then (RNS/Resource.py
+    /// `get_progress`), until the send is delivered.  The caller maps it
+    /// onto its own scale (LXMF: 0.10 + 0.90 × fraction, LXMF/LXMessage.py
+    /// `__update_transfer_progress`).  When one tier's Resource fails and the
+    /// next tier's starts, the fraction starts again from that Resource's own
+    /// beginning, so the values need not rise monotonically.
+    Fraction(f64),
+    /// It concluded without delivering: FAILED (its advertisement went
+    /// unanswered, a request or the proof timed out, its link closed) or
+    /// REJECTED.  Reported before its tier's failure is, so before any next
+    /// tier's Resource can advertise: a handover's path race and link setup
+    /// fall between two Resources, never inside one (since 2026-10-01; until
+    /// then LXMF's watch ran on across a handover and asserted the next
+    /// tier's setup as a silent transfer).
+    Ended,
+}
+
+/// The caller's line from the Resources carrying a send ([`SendProgress`]).
+/// A send that fits one link packet reports nothing.
+/// Keep it short: a `Fraction` runs on the thread serving the receiver's
+/// request, and an `Ended` on the thread concluding the Resource, both with
+/// that Resource's lock held; an `Advertised` runs on the advertise thread
+/// with no lock held.  It must never wait on the link.
+pub type SendProgressCallback = Arc<dyn Fn(SendProgress) + Send + Sync + 'static>;
 
 /// Per-destination lifecycle mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -858,10 +881,11 @@ impl AppLinks {
     /// re-sent or timed here beyond the stack's own receipt timeout; the
     /// caller owns the message state.
     ///
-    /// `on_progress` hears the Resource's fraction while a payload over the
-    /// link MDU transfers, and its advertisement
-    /// ([`SendProgressCallback`]); a packet reports nothing. Never on the
-    /// calling thread, so the caller may hold a lock the callback takes.
+    /// `on_progress` hears the Resource's advertisement, its fraction while a
+    /// payload over the link MDU transfers, and its end if it concludes
+    /// without delivering ([`SendProgress`]); a packet reports nothing.
+    /// Never on the calling thread, so the caller may hold a lock the
+    /// callback takes.
     ///
     /// Returns `Err` when no active link is held or the packet could not be
     /// queued, in which case no callback fires.
@@ -1604,8 +1628,8 @@ impl AppLinks {
     /// (LXMF: `compression_support_from_app_data` on the peer's announce).
     /// A message over the link MDU travels as a Resource; `compress` is that
     /// Resource's auto-compress switch, and `on_progress` hears its
-    /// advertisement and its fraction as it transfers
-    /// ([`SendProgressCallback`]).
+    /// advertisement, its fraction as it transfers and its end if it
+    /// concludes without delivering ([`SendProgress`]).
     pub fn send_with_compression(
         dest: &[u8],
         packed: Vec<u8>,
@@ -2316,7 +2340,9 @@ impl AppLinks {
     /// 2026-09-29 it was `None`: the message sat at 5 % for the whole
     /// transfer and the timers took a moving transfer for a stuck one.
     /// The caller also hears the advertisement once it has gone out
-    /// (`TransferWatch::advertised`, since 2026-10-01).
+    /// (`TransferWatch::advertised`) and the Resource's end when it
+    /// concludes without delivering (`TransferWatch::ended`), since
+    /// 2026-10-01.
     fn fire_resource_on_link(
         link: &LinkHandle,
         packed: &[u8],
@@ -2331,8 +2357,12 @@ impl AppLinks {
             return false;
         }
         let progress = watch.resource_progress(delivered.clone());
-        let advertised = watch.advertised(delivered.clone());
-        let concluded = Self::resource_concluded(delivered, on_delivered, on_outcome_failed);
+        // This Resource has concluded without delivering: its advertisement
+        // report, should the advertise thread run late, is not made after
+        // its end (DESIGN_PRINCIPLES §1, bulk transfers).
+        let ended = Arc::new(AtomicBool::new(false));
+        let advertised = watch.advertised(delivered.clone(), ended.clone());
+        let concluded = Self::resource_concluded(delivered, on_delivered, watch.ended(ended, on_outcome_failed));
         match Resource::new_internal(
             Some(ResourceData::Bytes(packed.to_vec())),
             link.clone(),
@@ -2495,33 +2525,65 @@ impl TransferWatch {
                 watch.activity.mark();
             }
             if let Some(on_progress) = &watch.on_progress {
-                on_progress(fraction);
+                on_progress(SendProgress::Fraction(fraction));
             }
         }
     }
 
     /// The hook for one Resource carrying the send that runs once its
-    /// advertisement has gone out (`Resource::advertise_shared_then`): until
-    /// `delivered` is set it hands the caller the Resource's fraction then,
-    /// 0.0. DESIGN_PRINCIPLES §1, bulk transfers: from the advertisement on
-    /// the transfer must show progress at least every 5 s, and LXMF's send
-    /// assertion starts that watch here (`transfer_progress_reporter`). It
-    /// is also where LXMF/LXMessage.py puts a Resource send at 0.10, the
-    /// fraction 0.0 on LXMF's scale.
+    /// advertisement has gone out (`Resource::advertise_shared_then`): unless
+    /// `delivered` is set, or the Resource has already `ended` (its link
+    /// closed between the advertisement and this hook), it hands the caller
+    /// [`SendProgress::Advertised`]. DESIGN_PRINCIPLES §1, bulk transfers:
+    /// from the advertisement on the transfer must show progress at least
+    /// every 5 s, and LXMF's send assertion starts its watch on this
+    /// Resource here (`transfer_progress_reporter`). It is also where
+    /// LXMF/LXMessage.py puts a Resource send at 0.10, the fraction 0.0 on
+    /// LXMF's scale.
     ///
     /// Not transfer activity: nothing of the message has been sent yet, so
     /// Timer P and the outcome backstop count on from the last time some
     /// was (`TransferActivity`), as before.
-    fn advertised(&self, delivered: Arc<AtomicBool>) -> Box<dyn FnOnce() + Send + 'static> {
+    fn advertised(&self, delivered: Arc<AtomicBool>, ended: Arc<AtomicBool>) -> Box<dyn FnOnce() + Send + 'static> {
         let on_progress = self.on_progress.clone();
         Box::new(move || {
-            if delivered.load(Ordering::Acquire) {
+            if delivered.load(Ordering::Acquire) || ended.load(Ordering::Acquire) {
                 return;
             }
             if let Some(on_progress) = on_progress {
-                on_progress(0.0);
+                on_progress(SendProgress::Advertised);
             }
         })
+    }
+
+    /// The failure hook for one Resource carrying the send
+    /// ([`AppLinks::resource_concluded`] runs it when the Resource concludes
+    /// without COMPLETE): it marks the Resource `ended`, hands the caller
+    /// [`SendProgress::Ended`], and only then runs `failed`, the tier's own
+    /// failure event, which may hand the send over to the next tier.
+    /// DESIGN_PRINCIPLES §1, bulk transfers: LXMF's watch on this Resource
+    /// stops here, so the next tier's path race and link setup are not
+    /// counted as this Resource's silence, as Retichat-js's Resource watch
+    /// stops at its own conclusion (`bulkStop`). Until 2026-10-01 nothing
+    /// reported the end, and the watch ran on across a handover.
+    ///
+    /// Not transfer activity, and the send's delivered gate does not hold it
+    /// back: a Resource that failed has ended whatever another tier did.
+    fn ended(
+        &self,
+        ended: Arc<AtomicBool>,
+        failed: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
+    ) -> Option<Arc<dyn Fn() + Send + Sync + 'static>> {
+        let on_progress = self.on_progress.clone();
+        Some(Arc::new(move || {
+            ended.store(true, Ordering::Release);
+            if let Some(on_progress) = &on_progress {
+                on_progress(SendProgress::Ended);
+            }
+            if let Some(failed) = &failed {
+                failed();
+            }
+        }))
     }
 
     /// The `progress_callback` for one Resource carrying the send
@@ -3132,7 +3194,8 @@ impl AppLinks {
 //       (the delivered gate remains settable from any tier at any time).
 //   §O6 A Resource's progress reaches the caller until delivery, and marks
 //       transfer activity when more of it has been sent. Its advertisement
-//       reaches the caller too, once it has gone out (0.0), and is not
+//       reaches the caller too, once it has gone out, and its end, when it
+//       concludes without delivering, before its tier's failure; neither is
 //       activity (DESIGN_PRINCIPLES §1, bulk transfers).
 //   §O7 A transfer that keeps moving gets no Timer P backup and its outcome
 //       wait does not go quiet; a silent one gets both.
@@ -3211,6 +3274,16 @@ mod tests {
     /// `progress` as its progress callback. Its data is never built (that
     /// needs an established link); `request` below serves requests on it the
     /// way the stack does and calls the callback the way the stack does.
+    /// A send's watch whose caller records every report.
+    fn recording_watch() -> (TransferWatch, Arc<Mutex<Vec<SendProgress>>>) {
+        let seen: Arc<Mutex<Vec<SendProgress>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_cb = seen.clone();
+        let watch = TransferWatch::new(Some(Arc::new(move |event| {
+            seen_cb.lock().unwrap().push(event);
+        })));
+        (watch, seen)
+    }
+
     fn sending_resource(
         total_parts: usize,
         progress: Arc<dyn Fn(Arc<Mutex<reticulum_rust::resource::Resource>>) + Send + Sync>,
@@ -3920,45 +3993,91 @@ mod tests {
     // the stack's request path, and stops at delivery.
     #[test]
     fn a_resource_reports_its_progress_to_the_caller_until_delivery() {
-        let seen: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
-        let seen_cb = seen.clone();
-        let watch = TransferWatch::new(Some(Arc::new(move |fraction| {
-            seen_cb.lock().unwrap().push(fraction);
-        })));
+        let (watch, seen) = recording_watch();
         let delivered = Arc::new(AtomicBool::new(false));
         let mut resource = sending_resource(4, watch.resource_progress(delivered.clone()));
 
         serve_request(&mut resource, 1);
         serve_request(&mut resource, 2);
         serve_request(&mut resource, 3);
-        assert_eq!(*seen.lock().unwrap(), vec![0.25, 0.5, 0.75], "the raw Resource fraction, per request served");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![SendProgress::Fraction(0.25), SendProgress::Fraction(0.5), SendProgress::Fraction(0.75)],
+            "the raw Resource fraction, per request served"
+        );
 
         delivered.store(true, Ordering::Release);
         serve_request(&mut resource, 4);
         assert_eq!(seen.lock().unwrap().len(), 3, "nothing is reported after delivery");
     }
 
-    // §O6 — the advertisement reaches the caller as 0.0 (LXMF's §1 watch on
-    // the transfer starts there: DESIGN_PRINCIPLES §1, bulk transfers), until
-    // delivery, and is not activity: nothing of the message has been sent.
+    // §O6 — the advertisement reaches the caller (LXMF's §1 watch on the
+    // Resource starts there: DESIGN_PRINCIPLES §1, bulk transfers), until
+    // delivery and never after the Resource's end, and is not activity:
+    // nothing of the message has been sent.
     #[test]
     fn the_advertisement_reaches_the_caller_and_is_not_activity() {
-        let seen: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
-        let seen_cb = seen.clone();
-        let watch = TransferWatch::new(Some(Arc::new(move |fraction| {
-            seen_cb.lock().unwrap().push(fraction);
-        })));
+        let (watch, seen) = recording_watch();
         let delivered = Arc::new(AtomicBool::new(false));
         let before = watch.activity.quiet_deadline(Duration::ZERO);
 
         std::thread::sleep(Duration::from_millis(5));
-        (watch.advertised(delivered.clone()))();
-        assert_eq!(*seen.lock().unwrap(), vec![0.0], "the advertisement, as the Resource's fraction then");
+        (watch.advertised(delivered.clone(), Arc::new(AtomicBool::new(false))))();
+        assert_eq!(*seen.lock().unwrap(), vec![SendProgress::Advertised], "the advertisement");
         assert_eq!(watch.activity.quiet_deadline(Duration::ZERO), before, "the advertisement is not activity");
 
+        // The advertise thread ran late: the Resource's link closed after
+        // its advertisement went out, and it has already ended.
+        (watch.advertised(delivered.clone(), Arc::new(AtomicBool::new(true))))();
+        assert_eq!(seen.lock().unwrap().len(), 1, "nothing is reported after the Resource's end");
+
         delivered.store(true, Ordering::Release);
-        (watch.advertised(delivered))();
+        (watch.advertised(delivered, Arc::new(AtomicBool::new(false))))();
         assert_eq!(seen.lock().unwrap().len(), 1, "nothing is reported after delivery");
+    }
+
+    // §O6 — a Resource that concludes without delivering reports its end to
+    // the caller, and only then runs its tier's failure (which may hand the
+    // send over), so the caller's §1 watch on it stops before any next
+    // tier's Resource can advertise (DESIGN_PRINCIPLES §1, bulk transfers).
+    // The end is not activity. A Resource that completes reports no end.
+    // The production conclusion callback, run as RNS/Resource.py runs it.
+    #[test]
+    fn a_resource_that_ends_without_delivering_reports_its_end_before_its_failure() {
+        use reticulum_rust::resource::ResourceStatus;
+        let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let heard = events.clone();
+        let watch = TransferWatch::new(Some(Arc::new(move |event| {
+            heard.lock().unwrap().push(format!("{:?}", event));
+        })));
+        let concluded_as = |status: ResourceStatus| -> (Vec<String>, Arc<AtomicBool>) {
+            events.lock().unwrap().clear();
+            let delivered = Arc::new(AtomicBool::new(false));
+            let ended = Arc::new(AtomicBool::new(false));
+            let (on_delivered, on_failed) = (events.clone(), events.clone());
+            let concluded = AppLinks::resource_concluded(
+                delivered.clone(),
+                Arc::new(move || on_delivered.lock().unwrap().push("delivered".into())),
+                watch.ended(ended.clone(), Some(Arc::new(move || on_failed.lock().unwrap().push("tier failed".into())))),
+            );
+            let mut resource = sending_resource(4, watch.resource_progress(delivered));
+            resource.status = status;
+            concluded(Arc::new(Mutex::new(resource)));
+            (events.lock().unwrap().clone(), ended)
+        };
+        let before = watch.activity.quiet_deadline(Duration::ZERO);
+        std::thread::sleep(Duration::from_millis(5));
+
+        for status in [ResourceStatus::Failed, ResourceStatus::Rejected] {
+            let (heard, ended) = concluded_as(status);
+            assert_eq!(heard, vec!["Ended".to_string(), "tier failed".to_string()], "{:?}: the end, then the tier's failure", status);
+            assert!(ended.load(Ordering::Acquire), "{:?}: a late advertisement report is held back from here on", status);
+        }
+        assert_eq!(watch.activity.quiet_deadline(Duration::ZERO), before, "the end is not activity");
+
+        let (heard, ended) = concluded_as(ResourceStatus::Complete);
+        assert_eq!(heard, vec!["delivered".to_string()], "a Resource that completes has delivered: no end");
+        assert!(!ended.load(Ordering::Acquire));
     }
 
     // §O6 — a Resource that is never advertised reports no advertisement.
@@ -3968,19 +4087,16 @@ mod tests {
     #[test]
     fn a_resource_never_advertised_reports_no_advertisement() {
         use reticulum_rust::resource::{Resource, ResourceStatus};
-        let seen: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
-        let seen_cb = seen.clone();
-        let watch = TransferWatch::new(Some(Arc::new(move |fraction| {
-            seen_cb.lock().unwrap().push(fraction);
-        })));
+        let (watch, seen) = recording_watch();
         let delivered = Arc::new(AtomicBool::new(false));
+        let ended = Arc::new(AtomicBool::new(false));
         let (tx, concluded) = mpsc::channel();
         let tx = Mutex::new(tx);
         let mut resource = sending_resource(4, watch.resource_progress(delivered.clone()));
         resource.callback = Some(Arc::new(move |r: Arc<Mutex<Resource>>| {
             let _ = tx.lock().unwrap().send(r.lock().map(|r| r.status).ok());
         }));
-        Resource::advertise_shared_then(Arc::new(Mutex::new(resource)), watch.advertised(delivered));
+        Resource::advertise_shared_then(Arc::new(Mutex::new(resource)), watch.advertised(delivered, ended));
 
         assert_eq!(
             concluded.recv_timeout(Duration::from_secs(5)).expect("it concludes"),
@@ -4150,7 +4266,12 @@ mod tests {
         assert!(resource.contains("let progress = watch.resource_progress(delivered.clone());"));
         // DESIGN_PRINCIPLES §1, bulk transfers: the caller hears the
         // advertisement once it has gone out, from the advertise thread.
-        assert!(resource.contains("let advertised = watch.advertised(delivered.clone());"));
+        assert!(resource.contains("let advertised = watch.advertised(delivered.clone(), ended.clone());"));
+        // …and the Resource's end, before its tier's failure.
+        assert!(
+            resource.contains("Self::resource_concluded(delivered, on_delivered, watch.ended(ended, on_outcome_failed));"),
+            "the delivery Resource concludes through the hook that reports its end"
+        );
         assert!(
             resource.contains("Resource::advertise_shared_then(Arc::new(Mutex::new(resource)), advertised);")
                 && !resource.contains("Resource::advertise_shared("),
