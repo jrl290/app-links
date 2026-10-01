@@ -87,7 +87,11 @@ For direct LXMF delivery, AppLinks acts as a send orchestrator.
 - It reports a Resource transfer's progress to the caller
 	(`send_with_compression` / `send_on_held_link`, `SendProgressCallback`):
 	the raw `Resource::get_progress` fraction after each request served, until
-	delivery. A message that fits one link packet reports nothing.
+	delivery, and 0.0 once the Resource's advertisement has gone out. A
+	message that fits one link packet reports nothing. The advertisement
+	report starts LXMF's §1 watch on the transfer (DESIGN_PRINCIPLES §1, bulk
+	transfers: from the advertisement on, progress at least every 5 s; total
+	time is not measured). It is not transfer activity for Timer P.
 
 In other words, for direct LXMF delivery AppLinks is not just keeping a link
 alive. It decides how the send is attempted and which link path is used.
