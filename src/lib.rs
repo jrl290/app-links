@@ -146,6 +146,20 @@
 //! `AppLinks::open_persistent()` uses the same path-race gate, then
 //! establishes and holds an outbound `LinkHandle` in `Registry.links`.
 //! The underlying `Link` actor owns keepalive and stale detection.
+//!
+//! # Status events
+//!
+//! Every change is reported to the callbacks of
+//! [`AppLinks::register_status_callback`] as `(dest_hash, status, link)`.
+//! `APP_LINK_NONE` .. `APP_LINK_DISCONNECTED` are the states
+//! [`AppLinks::status`] returns.  [`APP_LINK_RECOVERED`] is the one EVENT that
+//! is never a state: a held persistent link that had gone STALE heard from
+//! its peer again and is ACTIVE once more, and `status` reads
+//! `APP_LINK_ACTIVE` as it did before the link went quiet.  Together with
+//! `APP_LINK_ACTIVE` (a new link's establishment) it is how a host hears
+//! that a persistent link "comes up" (DESIGN_PRINCIPLES.md §3, what a device
+//! owes its distro).  A host that does not know it can ignore it: it changes
+//! no state here.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -175,6 +189,17 @@ pub const APP_LINK_PATH_REQUESTED: u8 = 0x01;
 pub const APP_LINK_ESTABLISHING: u8 = 0x02;
 pub const APP_LINK_ACTIVE: u8 = 0x03;
 pub const APP_LINK_DISCONNECTED: u8 = 0x04;
+/// An EVENT, never a state: the persistent outbound link held for the
+/// destination had gone STALE and has heard from its peer again, so it is
+/// ACTIVE once more (Reticulum-rust `link_recovered`, PARITY-AUDIT-1.5.2.md
+/// A34).  Reported once per STALE → ACTIVE transition, with the link's handle,
+/// and only while that handle is still the link the registry holds: the
+/// recovery of a link a newer one has replaced reports nothing.
+///
+/// [`AppLinks::status`] never returns it; at the event it returns
+/// `APP_LINK_ACTIVE`.  Nothing else is changed by it: a registry that
+/// ignored it behaves as it did.
+pub const APP_LINK_RECOVERED: u8 = 0x05;
 
 /// Tier-advance stagger for a message that fits ONE link packet: after a
 /// tier fires its packet, the next tier fires this many seconds later unless
@@ -525,6 +550,56 @@ impl AppLinks {
                 Self::request_reopen_internal(&dest_hash, false);
             }
         }
+    }
+
+    /// A STALE link heard from its peer again (`link_recovered`).  One
+    /// `APP_LINK_RECOVERED` event, with the handle, for the link the registry
+    /// still holds for `dest_hash`.  A link that has been replaced by a newer
+    /// one reports nothing: it decides nothing, and keeps its grace for a late
+    /// proof (DESIGN_PRINCIPLES.md §3).  Nor does one the registry no longer
+    /// holds, which has closed or been closed.
+    fn handle_tracked_outbound_recovered(dest_hash: Vec<u8>, recovered: LinkHandle) {
+        let tracked = REGISTRY
+            .lock()
+            .map(|reg| {
+                reg.links
+                    .get(&dest_hash)
+                    .map(|held| held.same_link(&recovered))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        if !tracked {
+            log(
+                &format!(
+                    "[APP_LINK] a link that recovered is not the one held for {}: not reported",
+                    hexrep(&dest_hash, false)
+                ),
+                LOG_NOTICE,
+                false,
+                false,
+            );
+            return;
+        }
+        log(
+            &format!(
+                "[APP_LINK] persistent outbound link recovered for {}",
+                hexrep(&dest_hash, false)
+            ),
+            LOG_NOTICE,
+            false,
+            false,
+        );
+        Self::emit_status(&dest_hash, APP_LINK_RECOVERED, Some(recovered));
+    }
+
+    /// Have `link`, the outbound link just established and tracked for
+    /// `dest_hash`, report its recovery from STALE as `APP_LINK_RECOVERED`.
+    /// Installed beside its close callback.
+    fn watch_recovery(dest_hash: &[u8], link: &LinkHandle) {
+        let dest_recovered = dest_hash.to_vec();
+        link.set_link_recovered_callback(Some(Arc::new(move |recovered: LinkHandle| {
+            AppLinks::handle_tracked_outbound_recovered(dest_recovered.clone(), recovered);
+        })));
     }
 
     // ─── Host integration ─────────────────────────────────────────────
@@ -921,6 +996,9 @@ impl AppLinks {
     ///                                 the last direct send had to escalate to
     ///                                 propagation and no fresh path/link
     ///                                 success has cleared that red latch yet.
+    ///
+    /// `APP_LINK_RECOVERED` is never returned: it is an event reported to the
+    /// status callbacks, and a recovered link reads `APP_LINK_ACTIVE` here.
     pub fn status(dest_hash: &[u8]) -> u8 {
         let (registered, in_flight, link, inbound, in_ready, prop_fallback_disconnected) = {
             let reg = match REGISTRY.lock() {
@@ -1496,6 +1574,9 @@ impl AppLinks {
                                 },
                             )));
                         }
+                        // A link is never STALE before it has been ACTIVE, so
+                        // its recovery is heard from here on, beside its close.
+                        AppLinks::watch_recovery(&dest_cb, &established_handle);
 
                         spec_cb.ever_established.store(true, Ordering::Relaxed);
                         spec_cb.reconnect_armed.store(true, Ordering::Release);
@@ -3774,6 +3855,254 @@ mod tests {
             fragment.contains("persistent open: link closed before active"),
             "persistent open must still surface deterministic close-before-active failures"
         );
+    }
+
+    // ── APP_LINK_RECOVERED: a held link's recovery from STALE ─────────────────
+
+    /// What the registry reports for `dest`, from now on: `(status, link id,
+    /// what AppLinks::status(dest) read at that moment)`. The link id is empty
+    /// for an event that carries no link.
+    fn record_events_for(dest: &[u8]) -> Arc<Mutex<Vec<(u8, Vec<u8>, u8)>>> {
+        let seen: Arc<Mutex<Vec<(u8, Vec<u8>, u8)>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_cb = seen.clone();
+        let dest = dest.to_vec();
+        AppLinks::register_status_callback(Arc::new(move |hash, status, link| {
+            if hash == dest.as_slice() {
+                let id = link.map(|l| l.link_id()).unwrap_or_default();
+                seen_cb.lock().unwrap().push((status, id, AppLinks::status(hash)));
+            }
+        }));
+        seen
+    }
+
+    /// True once `seen` holds `count` events (a test's failure mechanism: it
+    /// gives up after 5 s, never succeeds by waiting).
+    fn events_reach(seen: &Arc<Mutex<Vec<(u8, Vec<u8>, u8)>>>, count: usize) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if seen.lock().unwrap().len() >= count {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        seen.lock().unwrap().len() >= count
+    }
+
+    /// A live link actor that is STALE, an hour from the timeout that would
+    /// close it (so its own watchdog leaves it alone), and registered with the
+    /// runtime as a real link is: a packet addressed to its id reaches it.
+    fn stale_link(link_id: Vec<u8>) -> LinkHandle {
+        use reticulum_rust::destination::Destination;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is after 1970")
+            .as_secs();
+        let mut link = Link::new_inbound(Destination::default()).expect("test link");
+        link.link_id = link_id;
+        link.state = reticulum_rust::link::STATE_STALE;
+        link.status = reticulum_rust::link::STATE_STALE;
+        link.activated_at = Some(now);
+        link.last_inbound = now;
+        link.last_outbound = now;
+        link.last_proof = now;
+        link.stale_since = Some(now);
+        link.stale_grace = 3600.0;
+        let handle = LinkHandle::spawn(link);
+        reticulum_rust::link::register_runtime_link_handle(handle.clone());
+        handle
+    }
+
+    /// The peer is heard from on the link `link_id`: a KEEPALIVE pong (0xFE),
+    /// which is never answered, so nothing goes out. True when the link
+    /// handled it.
+    fn peer_is_heard(link_id: &[u8]) -> bool {
+        use reticulum_rust::destination::Destination;
+        let mut pong = Packet::new(
+            Some(Destination::default()),
+            vec![0xFEu8],
+            packet::DATA,
+            packet::KEEPALIVE,
+            BROADCAST,
+            packet::HEADER_1,
+            None,
+            None,
+            false,
+            0,
+        );
+        pong.data = vec![0xFEu8];
+        pong.destination_hash = Some(link_id.to_vec());
+        reticulum_rust::link::dispatch_runtime_packet(&pong)
+    }
+
+    fn held_for_test(dest: &[u8], link: &LinkHandle) {
+        let mut reg = REGISTRY.lock().unwrap();
+        reg.specs.insert(
+            dest.to_vec(),
+            AppLinkSpec::with_mode("lxmf", vec!["propagation".into()], LinkMode::Persistent),
+        );
+        reg.links.insert(dest.to_vec(), link.clone());
+        reg.ready.insert(dest.to_vec(), Instant::now());
+    }
+
+    /// The new code is an event of its own: distinct from every state, and
+    /// never what `status` returns, so a host that has never heard of it sees
+    /// the same states as before.
+    #[test]
+    fn app_link_recovered_is_an_event_code_of_its_own_and_never_a_state() {
+        let states = [
+            APP_LINK_NONE,
+            APP_LINK_PATH_REQUESTED,
+            APP_LINK_ESTABLISHING,
+            APP_LINK_ACTIVE,
+            APP_LINK_DISCONNECTED,
+        ];
+        assert_eq!(APP_LINK_RECOVERED, 0x05, "the next code after DISCONNECTED (0x04)");
+        assert!(!states.contains(&APP_LINK_RECOVERED), "it reuses no state's code, ACTIVE's least");
+        let production = include_str!("lib.rs").split("#[cfg(test)]").next().unwrap();
+        let from = production.find("pub fn status(dest_hash: &[u8]) -> u8 {").expect("status exists");
+        let status = &production[from..];
+        let status = &status[..status.find("pub fn get_handle(").expect("status ends before get_handle")];
+        assert!(!status.contains("APP_LINK_RECOVERED"), "status() never returns the event");
+    }
+
+    /// The registry reports a recovery for the link it holds, with that link's
+    /// handle, and for no other: a link a newer one replaced reports nothing,
+    /// and nor does one the registry no longer holds.
+    #[test]
+    fn a_recovery_is_reported_for_the_held_link_only() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        reset_registry_for_test();
+        let dest: Vec<u8> = (0u8..16).map(|i| i.wrapping_mul(181)).collect();
+        let held = stale_link((0u8..16).map(|i| i.wrapping_mul(223)).collect());
+        let replaced = stale_link((0u8..16).map(|i| i.wrapping_mul(227)).collect());
+        assert!(!held.same_link(&replaced) && held.link_id() != replaced.link_id());
+        held_for_test(&dest, &held);
+        let seen = record_events_for(&dest);
+
+        AppLinks::handle_tracked_outbound_recovered(dest.clone(), held.clone());
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 1, "the held link's recovery is reported once, synchronously");
+            assert_eq!(seen[0].0, APP_LINK_RECOVERED);
+            assert_eq!(seen[0].1, held.link_id(), "with the link's handle");
+        }
+
+        AppLinks::handle_tracked_outbound_recovered(dest.clone(), replaced.clone());
+        assert_eq!(seen.lock().unwrap().len(), 1, "a link that is not the held one reports nothing");
+
+        REGISTRY.lock().unwrap().links.remove(&dest);
+        AppLinks::handle_tracked_outbound_recovered(dest.clone(), held.clone());
+        assert_eq!(seen.lock().unwrap().len(), 1, "a link the registry no longer holds reports nothing");
+
+        held.teardown();
+        replaced.teardown();
+        REGISTRY.lock().unwrap().status_callbacks.clear();
+        reset_registry_for_test();
+    }
+
+    /// End to end through a live link actor and Reticulum-rust's own STALE →
+    /// ACTIVE transition, with the callback installed by the production
+    /// function: the held link hears its peer again and the status callbacks
+    /// are told once, with the link ACTIVE by then; the packets after it, on a
+    /// link that is ACTIVE already, say nothing.
+    #[test]
+    fn a_held_stale_link_that_hears_its_peer_reports_recovered_once() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        reset_registry_for_test();
+        let dest: Vec<u8> = (0u8..16).map(|i| i.wrapping_mul(191)).collect();
+        let link_id: Vec<u8> = (0u8..16).map(|i| i.wrapping_mul(193)).collect();
+        let link = stale_link(link_id.clone());
+        held_for_test(&dest, &link);
+        AppLinks::watch_recovery(&dest, &link);
+        let seen = record_events_for(&dest);
+        assert_eq!(AppLinks::status(&dest), APP_LINK_ESTABLISHING, "a held STALE link is not ACTIVE");
+
+        assert!(peer_is_heard(&link_id), "the link handles the packet");
+        assert!(events_reach(&seen, 1), "the recovery is reported when the STALE link hears its peer");
+        assert_eq!(
+            seen.lock().unwrap()[0],
+            (APP_LINK_RECOVERED, link_id.clone(), APP_LINK_ACTIVE),
+            "one RECOVERED event for the held link, which AppLinks::status already reads as ACTIVE"
+        );
+        assert_eq!(AppLinks::status(&dest), APP_LINK_ACTIVE);
+
+        assert!(peer_is_heard(&link_id));
+        assert!(peer_is_heard(&link_id));
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(seen.lock().unwrap().len(), 1, "the link is ACTIVE: its next packets recover nothing");
+
+        link.teardown();
+        REGISTRY.lock().unwrap().status_callbacks.clear();
+        reset_registry_for_test();
+    }
+
+    /// A STALE link that a newer link has replaced in the registry hears its
+    /// peer again: nothing is reported for it, while the link now held reports
+    /// its own recovery as ever.
+    #[test]
+    fn a_replaced_stale_link_that_hears_its_peer_reports_nothing() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        reset_registry_for_test();
+        let dest: Vec<u8> = (0u8..16).map(|i| i.wrapping_mul(197)).collect();
+        let old_id: Vec<u8> = (0u8..16).map(|i| i.wrapping_mul(199)).collect();
+        let new_id: Vec<u8> = (0u8..16).map(|i| i.wrapping_mul(211)).collect();
+        let old = stale_link(old_id.clone());
+        let new = stale_link(new_id.clone());
+        AppLinks::watch_recovery(&dest, &old);
+        AppLinks::watch_recovery(&dest, &new);
+        // The registry held the old link, and a new establishment replaced it.
+        held_for_test(&dest, &old);
+        REGISTRY.lock().unwrap().links.insert(dest.clone(), new.clone());
+        let seen = record_events_for(&dest);
+
+        assert!(peer_is_heard(&old_id), "the replaced link handles the packet");
+        assert!(peer_is_heard(&new_id), "the held link handles the packet");
+        assert!(events_reach(&seen, 1), "the held link's recovery is reported");
+        std::thread::sleep(Duration::from_millis(300));
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 1, "and only that one: the replaced link's recovery reports nothing");
+            assert_eq!((seen[0].0, &seen[0].1), (APP_LINK_RECOVERED, &new_id));
+        }
+
+        old.teardown();
+        new.teardown();
+        REGISTRY.lock().unwrap().status_callbacks.clear();
+        reset_registry_for_test();
+    }
+
+    /// `establish_persistent` has the link it holds report its recovery: from
+    /// its established callback, after the check that the link is still the
+    /// tracked one, beside its close callback, and through the production
+    /// watcher that reports only the held link.
+    #[test]
+    fn a_persistent_link_is_watched_for_recovery_once_established_and_tracked() {
+        let production = include_str!("lib.rs").split("#[cfg(test)]").next().unwrap();
+        let start = production
+            .find("fn establish_persistent(dest_hash: &[u8], spec: AppLinkSpec)")
+            .expect("persistent establish path must exist");
+        let tail = &production[start..];
+        let fragment = &tail[..tail.find("// ─── Three-tier send").expect("the fragment ends before the send tiers")];
+        let established = fragment.find("set_link_established_callback(Some").expect("activation is callback-driven");
+        let tracked = fragment.find("if !still_tracked").expect("the established callback checks the link is still tracked");
+        let closed = fragment.find("handle_tracked_outbound_closed(dest_closed.clone(), closing)").expect("the tracked link's close is heard");
+        let watched = fragment
+            .find("AppLinks::watch_recovery(&dest_cb, &established_handle);")
+            .expect("the established link is watched for its recovery");
+        assert!(established < tracked && tracked < closed && closed < watched,
+            "the watch is installed from the established callback, for a tracked link, beside its close");
+
+        let from = production.find("fn handle_tracked_outbound_recovered(").expect("the recovery handler exists");
+        let handler = &production[from..];
+        let handler = &handler[..handler.find("fn watch_recovery(").expect("the watcher follows it")];
+        assert!(handler.contains("held.same_link(&recovered)"), "only the held link is reported");
+        assert!(handler.contains("Self::emit_status(&dest_hash, APP_LINK_RECOVERED, Some(recovered));"),
+            "the event carries the link's handle");
+        let from = production.find("fn watch_recovery(").expect("the watcher exists");
+        let watcher = &production[from..];
+        let watcher = &watcher[..watcher.find("// ─── Host integration").expect("the watcher ends before the host section")];
+        assert!(watcher.contains("set_link_recovered_callback(Some"));
+        assert!(watcher.contains("AppLinks::handle_tracked_outbound_recovered(dest_recovered.clone(), recovered);"));
     }
 
     #[test]
