@@ -316,6 +316,96 @@ pub enum SendProgress {
 /// with no lock held.  It must never wait on the link.
 pub type SendProgressCallback = Arc<dyn Fn(SendProgress) + Send + Sync + 'static>;
 
+/// DESIGN_PRINCIPLES §1, bulk transfers (James, 2026-09-30): from its
+/// advertisement on, a Resource must show progress at least every 5 s; a
+/// longer silence is a §1 violation and is logged as one, and it is never
+/// used to decide the send. This is that watch for a caller of
+/// [`AppLinks::send_on_held_link`] with no watch of its own (the phones'
+/// distro outbox uploads; LXMRouter has its own). It is fed only by the
+/// progress the Resource already reports ([`SendProgress`]), through
+/// [`Self::on_progress`], and by the delivery, through [`Self::delivered`].
+///
+/// It starts at the Resource's first event (its `Advertised`, or on a fast
+/// link a `Fraction` that came first), measures the silence before each
+/// later event, and stops at `Ended` or the delivery. A silence over the
+/// limit is logged when it ends, at the next event: no timer runs
+/// (DESIGN_PRINCIPLES §4), and every Resource ends with one of those
+/// events. It logs and decides nothing: it holds no callback of the send,
+/// and nothing reads it back.
+pub struct ResourceSilenceWatch {
+    label: String,
+    /// When the watched Resource last showed progress; `None` when nothing
+    /// is being watched.
+    last: Mutex<Option<Instant>>,
+    sink: Arc<dyn Fn(&str) + Send + Sync + 'static>,
+}
+
+impl ResourceSilenceWatch {
+    /// A watch whose lines name the upload `label`, logged at ERROR.
+    pub fn new(label: impl Into<String>) -> Arc<Self> {
+        Self::with_sink(
+            label,
+            Arc::new(|line: &str| log(line, reticulum_rust::LOG_ERROR, false, false)),
+        )
+    }
+
+    /// A watch whose lines go to `sink` (tests).
+    fn with_sink(label: impl Into<String>, sink: Arc<dyn Fn(&str) + Send + Sync + 'static>) -> Arc<Self> {
+        Arc::new(Self { label: label.into(), last: Mutex::new(None), sink })
+    }
+
+    /// The `on_progress` to pass to `send_on_held_link`.
+    pub fn on_progress(self: &Arc<Self>) -> SendProgressCallback {
+        let watch = Arc::clone(self);
+        Arc::new(move |event| {
+            watch.note(event, Instant::now());
+        })
+    }
+
+    /// The send was delivered (its `on_delivered`): the Resource's last
+    /// progress, its proof. The watch stops.
+    pub fn delivered(&self) {
+        self.stop(Instant::now(), "delivered");
+    }
+
+    /// One event of the watched Resource at `at`. Returns the silence it
+    /// ended when that was over the §1 limit (it has been logged).
+    fn note(&self, event: SendProgress, at: Instant) -> Option<Duration> {
+        match event {
+            SendProgress::Advertised | SendProgress::Fraction(_) => {
+                let mut last = self.last.lock().unwrap_or_else(|p| p.into_inner());
+                let silence = last.map(|previous| at.saturating_duration_since(previous));
+                *last = Some(at);
+                drop(last);
+                silence.and_then(|silence| self.over_limit(silence, "moving again"))
+            }
+            SendProgress::Ended => self.stop(at, "ended"),
+        }
+    }
+
+    fn stop(&self, at: Instant, how: &str) -> Option<Duration> {
+        let previous = self.last.lock().unwrap_or_else(|p| p.into_inner()).take()?;
+        self.over_limit(at.saturating_duration_since(previous), how)
+    }
+
+    fn over_limit(&self, silence: Duration, how: &str) -> Option<Duration> {
+        if silence.as_secs_f64() <= reticulum_rust::send_assertion::SEND_LATENCY_LIMIT_SECS {
+            return None;
+        }
+        // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+        (self.sink)(&format!(
+            "DESIGN_PRINCIPLES §1 VIOLATION: {} Resource transfer silent for {:.2}s, {} \
+             (limit {:.1}s between progress events; total time is not measured). \
+             Logged only: the Resource's own events decide the upload. FIX THE CODE.",
+            self.label,
+            silence.as_secs_f64(),
+            how,
+            reticulum_rust::send_assertion::SEND_LATENCY_LIMIT_SECS,
+        ));
+        Some(silence)
+    }
+}
+
 /// Per-destination lifecycle mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum LinkMode {
@@ -960,7 +1050,8 @@ impl AppLinks {
     /// payload over the link MDU transfers, and its end if it concludes
     /// without delivering ([`SendProgress`]); a packet reports nothing.
     /// Never on the calling thread, so the caller may hold a lock the
-    /// callback takes.
+    /// callback takes. [`ResourceSilenceWatch`] is a log-only §1 watch a
+    /// caller can pass here.
     ///
     /// `on_never_left` is for a caller that owes the upload
     /// (DESIGN_PRINCIPLES §3: an upload that never left the device, because
@@ -4896,6 +4987,75 @@ mod tests {
         );
         drop(held);
         reset_registry_for_test();
+    }
+
+    // ── §1 watch for a held-link upload: logs, decides nothing ──────────
+
+    fn recording_silence_watch() -> (Arc<ResourceSilenceWatch>, Arc<Mutex<Vec<String>>>) {
+        let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = lines.clone();
+        let watch = ResourceSilenceWatch::with_sink("distro upload", Arc::new(move |line: &str| {
+            sink.lock().unwrap().push(line.to_string());
+        }));
+        (watch, lines)
+    }
+
+    // DESIGN_PRINCIPLES §1, bulk transfers: a silence of more than 5 s
+    // between a Resource's progress events is logged as a §1 violation, at
+    // the event that ends it; a moving transfer logs nothing however long it
+    // takes. Total time is not measured.
+    #[test]
+    fn the_silence_watch_logs_each_silence_over_five_seconds_and_nothing_else() {
+        let (watch, lines) = recording_silence_watch();
+        let t0 = Instant::now();
+        let at = |secs: f64| t0 + Duration::from_secs_f64(secs);
+
+        assert_eq!(watch.note(SendProgress::Advertised, at(0.0)), None);
+        for step in 1..=10 {
+            assert_eq!(watch.note(SendProgress::Fraction(step as f64 / 20.0), at(step as f64 * 4.0)), None,
+                "moving every 4 s: 40 s in all, no silence");
+        }
+        let silence = watch.note(SendProgress::Fraction(0.6), at(46.5)).expect("6.5 s without progress");
+        assert!((silence.as_secs_f64() - 6.5).abs() < 1e-6);
+        assert_eq!(watch.note(SendProgress::Fraction(0.7), at(47.0)), None);
+        let silence = watch.note(SendProgress::Ended, at(60.0)).expect("13 s, then its end");
+        assert!((silence.as_secs_f64() - 13.0).abs() < 1e-6);
+
+        let lines = lines.lock().unwrap().clone();
+        assert_eq!(lines.len(), 2, "{:?}", lines);
+        assert!(lines[0].starts_with("DESIGN_PRINCIPLES §1 VIOLATION: distro upload Resource transfer silent for 6.50s, moving again"), "{}", lines[0]);
+        assert!(lines[1].contains("silent for 13.00s, ended"), "{}", lines[1]);
+        assert!(lines.iter().all(|line| line.contains("Logged only")), "it decides nothing");
+    }
+
+    // The watch starts at the Resource's first event (on a fast link a
+    // Fraction can come before its Advertised), and stops at its end or at
+    // the delivery: after that, nothing is measured.
+    #[test]
+    fn the_silence_watch_runs_from_the_first_event_to_the_end_or_the_delivery() {
+        let t0 = Instant::now();
+        let at = |secs: f64| t0 + Duration::from_secs_f64(secs);
+
+        let (watch, lines) = recording_silence_watch();
+        assert_eq!(watch.note(SendProgress::Ended, at(30.0)), None, "nothing watched: nothing to end");
+        assert_eq!(watch.stop(at(30.0), "delivered"), None);
+        assert_eq!(watch.note(SendProgress::Fraction(0.5), at(40.0)), None, "a first Fraction starts it");
+        assert_eq!(watch.note(SendProgress::Advertised, at(41.0)), None, "its Advertised after it is progress");
+        assert!(watch.stop(at(47.0), "delivered").is_some(), "the proof 6 s after the last progress");
+        assert_eq!(watch.stop(at(90.0), "delivered"), None, "stopped");
+        assert_eq!(watch.note(SendProgress::Ended, at(90.0)), None, "stopped");
+        assert_eq!(lines.lock().unwrap().len(), 1);
+        assert!(lines.lock().unwrap()[0].contains("silent for 6.00s, delivered"));
+
+        // Through the production callback and `delivered`, on the real
+        // clock: a quick transfer logs nothing.
+        let (watch, lines) = recording_silence_watch();
+        let on_progress = watch.on_progress();
+        on_progress(SendProgress::Advertised);
+        on_progress(SendProgress::Fraction(0.5));
+        watch.delivered();
+        on_progress(SendProgress::Ended);
+        assert!(lines.lock().unwrap().is_empty());
     }
 
     // §O6 — only more of the message sent is activity: a request that
