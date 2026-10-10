@@ -343,9 +343,11 @@ pub type SendProgressCallback = Arc<dyn Fn(SendProgress) + Send + Sync + 'static
 /// that lock, the next `if let Ok(..) = lock()` skipped, and the upload
 /// stalled until its link closed: the watch decided the send. In a debug
 /// build the recorded violations panic at the owner's end point,
-/// [`Self::finish`], which the owner calls last, once it has recorded and
-/// reported the upload's outcome; the panic runs on a thread of its own
-/// ([`assert_after_the_outcome`]). It decides nothing: it holds no callback
+/// [`Self::finish`], which the owner calls last, once it has reported the
+/// upload's outcome: recorded it, or handed it to the thread that records
+/// it (an owner whose callbacks pass the outcome on, as Retichat-android's
+/// do to its outbox, records it after the end point); the panic runs on a
+/// thread of its own ([`assert_after_the_outcome`]). It decides nothing: it holds no callback
 /// of the send, nothing reads it back, and it changes no state of the send.
 pub struct ResourceSilenceWatch {
     label: String,
@@ -402,17 +404,19 @@ impl ResourceSilenceWatch {
 
     /// The send was delivered (its `on_delivered`): the Resource's last
     /// progress, its proof. The watch stops. Call [`Self::finish`] after it,
-    /// once the delivery is recorded and reported.
+    /// once the delivery is reported.
     pub fn delivered(&self) {
         self.stop((self.clock)(), "delivered");
     }
 
     /// The owner's end point (DESIGN_PRINCIPLES §1, bulk transfers; James,
     /// 2026-10-10, "Panic at the end"). The owner calls it last, once it has
-    /// recorded and reported the upload's outcome, as the last thing it does
-    /// in whichever of these concludes the upload: its `on_delivered` (after
-    /// [`Self::delivered`] and its own record of the delivery), its
-    /// `on_failed`, its `on_never_left`, or after a send that returned `Err`.
+    /// reported the upload's outcome (recorded it, or handed it to the thread
+    /// that records it, which then records it after this call), as the last
+    /// thing it does in whichever of these concludes the upload: its
+    /// `on_delivered` (after [`Self::delivered`] and its own report of the
+    /// delivery), its `on_failed`, its `on_never_left`, or after a send that
+    /// returned `Err`.
     /// The watch stops (nothing is measured up to this call), and the
     /// violations it logged are taken: in a debug build, if there are any,
     /// they panic on a thread of their own ([`assert_after_the_outcome`]),
@@ -474,8 +478,9 @@ impl ResourceSilenceWatch {
 
 /// DESIGN_PRINCIPLES §1, bulk transfers (James, 2026-10-10, "Panic at the
 /// end"): the debug panic for the §1 violations one upload recorded, made
-/// once its owner has decided the upload's outcome and recorded and
-/// reported it. [`ResourceSilenceWatch::finish`] and LXMRouter's
+/// once its owner has decided the upload's outcome and reported it
+/// (recorded it, or handed it to the thread that records it).
+/// [`ResourceSilenceWatch::finish`] and LXMRouter's
 /// `process_outbound` (for a message it lets go of) call it.
 ///
 /// A violation is logged where it is found, in every build, and recorded;
@@ -493,8 +498,12 @@ impl ResourceSilenceWatch {
 /// runs, so nothing that bookkeeping needs comes after it, for this upload
 /// or any other. That is what lets the end point be called from where the
 /// outcome is handled, which for a Resource upload is a callback under the
-/// Resource's lock. Under `panic = "abort"` the process ends there, after
-/// the outcome was recorded. Returns that thread (tests join it to see the
+/// Resource's lock. Under the default `panic = "unwind"` that panic ends
+/// its own thread only. Under `panic = "abort"` the process ends there,
+/// after the outcome was reported, but not necessarily recorded: an owner
+/// that records it on another thread (Retichat-android's outbox does) may
+/// not have done so yet, and its next run starts from what it last stored
+/// (for that outbox, the upload still owed). Returns that thread (tests join it to see the
 /// panic); a caller need not join it.
 ///
 /// In a release build it does nothing and returns `None`: each violation
