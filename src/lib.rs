@@ -1050,30 +1050,58 @@ impl AppLinks {
     /// payload over the link MDU transfers, and its end if it concludes
     /// without delivering ([`SendProgress`]); a packet reports nothing.
     /// Never on the calling thread, so the caller may hold a lock the
-    /// callback takes. [`ResourceSilenceWatch`] is a log-only §1 watch a
-    /// caller can pass here.
+    /// callback takes. [`ResourceSilenceWatch`] is a §1 watch a caller can
+    /// pass here.
     ///
-    /// `on_never_left` is for a caller that owes the upload
+    /// A payload over the link MDU goes as a Resource whose advertisement
+    /// counts as sent whether or not an interface carried it
+    /// (RNS/Resource.py `__advertise_job`), and its failure after its
+    /// advertisement retries reaches `on_failed`. This is LXMRouter's
+    /// PROPAGATED upload. A caller that owes the upload uses
+    /// [`Self::send_on_held_link_owed`].
+    ///
+    /// Returns `Err` when no active link is held or the packet could not be
+    /// queued, in which case no callback fires.
+    pub fn send_on_held_link(
+        dest_hash: &[u8],
+        packed: Vec<u8>,
+        compress: bool,
+        on_delivered: Arc<dyn Fn() + Send + Sync + 'static>,
+        on_failed: Arc<dyn Fn() + Send + Sync + 'static>,
+        on_progress: Option<SendProgressCallback>,
+    ) -> Result<(), String> {
+        Self::send_held(dest_hash, packed, compress, on_delivered, on_failed, on_progress, None)
+    }
+
+    /// [`Self::send_on_held_link`] for an upload the caller owes
     /// (DESIGN_PRINCIPLES §3: an upload that never left the device, because
     /// no interface could carry it, is not a failure; the link is kept, and
-    /// it goes again at the next interface up-edge or coming-up). With it, a
-    /// payload over the link MDU whose Resource's first advertisement no
+    /// it goes again at the next interface up-edge or coming-up). The
+    /// phones' distro outbox uploads.
+    ///
+    /// A payload over the link MDU whose Resource's first advertisement no
     /// interface could carry (`Resource::advertise_shared_then_reporting`)
     /// never left: the Resource is marked ended and cancelled here, the
     /// link is left as it is, and `on_never_left` runs instead of
     /// `on_failed`, once, on the advertise thread. Whichever comes first,
     /// that or the Resource's own conclusion, decides the upload; the other
     /// then reports nothing. An advertisement that was carried leaves the
-    /// Resource's own completion or failure to decide, as without it (James,
-    /// 2026-10-04 and 2026-10-10). A packet that could not be queued is the
-    /// `Err` below, with or without it. With `None` (LXMRouter's PROPAGATED
-    /// upload) a Resource is today's: its advertisement counts as sent
-    /// whether or not it was carried (RNS/Resource.py `__advertise_job`),
-    /// and its failure after its advertisement retries reaches `on_failed`.
-    ///
-    /// Returns `Err` when no active link is held or the packet could not be
-    /// queued, in which case no callback fires.
-    pub fn send_on_held_link(
+    /// Resource's own completion or failure to decide, as
+    /// `send_on_held_link` does (James, 2026-10-04 and 2026-10-10). A packet
+    /// that could not be queued is the `Err`, as there.
+    pub fn send_on_held_link_owed(
+        dest_hash: &[u8],
+        packed: Vec<u8>,
+        compress: bool,
+        on_delivered: Arc<dyn Fn() + Send + Sync + 'static>,
+        on_failed: Arc<dyn Fn() + Send + Sync + 'static>,
+        on_progress: Option<SendProgressCallback>,
+        on_never_left: Arc<dyn Fn() + Send + Sync + 'static>,
+    ) -> Result<(), String> {
+        Self::send_held(dest_hash, packed, compress, on_delivered, on_failed, on_progress, Some(on_never_left))
+    }
+
+    fn send_held(
         dest_hash: &[u8],
         packed: Vec<u8>,
         compress: bool,
@@ -2436,7 +2464,7 @@ impl AppLinks {
     /// `SendOutcome` decides between tiers.  `on_outcome_failed` hears this
     /// attempt's own failure event: the receipt's timeout, or the Resource
     /// concluding without COMPLETE. `on_never_left` is
-    /// `send_on_held_link`'s, for a Resource only (`fire_resource_on_link`);
+    /// `send_on_held_link_owed`'s, for a Resource only (`fire_resource_on_link`);
     /// the tier chain passes `None`. A packet no interface could carry is
     /// `false` here, as before.
     fn fire_on_link(
@@ -2540,7 +2568,7 @@ impl AppLinks {
     /// concludes without delivering (`TransferWatch::ended`), since
     /// 2026-10-01.
     ///
-    /// With `on_never_left` (`send_on_held_link`'s), the Resource is
+    /// With `on_never_left` (`send_on_held_link_owed`'s), the Resource is
     /// advertised through `Resource::advertise_shared_then_reporting`, and an
     /// advertisement no interface carried makes the upload never-left
     /// (`NeverLeft`) instead of leaving it to fail after its retries. Without
@@ -2633,8 +2661,7 @@ impl AppLinks {
 /// never left the device (DESIGN_PRINCIPLES §3: James, 2026-10-06, for a
 /// Resource 2026-10-10). It is the Resource counterpart of a packet that
 /// could not be queued: nothing was sent, so it is not a failure, and the
-/// link is kept. Only for a caller of `send_on_held_link` that passes
-/// `on_never_left`.
+/// link is kept. Only for `send_on_held_link_owed`.
 ///
 /// One upload has one outcome: `decided` is taken once, by whichever comes
 /// first, this finding (`on_advertised`) or the Resource's own conclusion
@@ -3668,8 +3695,9 @@ mod tests {
         reset_registry_for_test();
     }
 
-    /// send_on_held_link fires no callback and reports the error when no
-    /// active link is held: the caller keeps its message OUTBOUND.
+    /// send_on_held_link (and send_on_held_link_owed) fires no callback and
+    /// reports the error when no active link is held: the caller keeps its
+    /// message OUTBOUND.
     #[test]
     fn send_on_held_link_without_active_link_is_an_error() {
         let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
@@ -3685,9 +3713,19 @@ mod tests {
             Arc::new(move || f1.store(true, Ordering::Release)),
             Arc::new(move || f2.store(true, Ordering::Release)),
             Some(Arc::new(move |_| f3.store(true, Ordering::Release))),
-            Some(Arc::new(move || f4.store(true, Ordering::Release))),
         );
         assert!(result.is_err());
+        let (f1, f2) = (fired.clone(), fired.clone());
+        let result = AppLinks::send_on_held_link_owed(
+            &dest,
+            vec![0x5Au8; 2048],
+            true,
+            Arc::new(move || f1.store(true, Ordering::Release)),
+            Arc::new(move || f2.store(true, Ordering::Release)),
+            None,
+            Arc::new(move || f4.store(true, Ordering::Release)),
+        );
+        assert!(result.is_err(), "no link held is not never-left: nothing was put in flight");
         assert!(!fired.load(Ordering::Acquire), "no callback without a send");
         assert!(!AppLinks::teardown_held_link(&dest), "nothing held to tear down");
         reset_registry_for_test();
@@ -4854,7 +4892,7 @@ mod tests {
     }
 
     // The short drop of 2026-10-06, for a Resource upload, through
-    // `send_on_held_link` on a real link and a real Resource: the
+    // `send_on_held_link_owed` on a real link and a real Resource: the
     // propagation link is up and its interface is down when the upload is
     // fired. The upload is never-left, with no failure and no teardown, and
     // nothing reaches the wire. The owner (here a stand-in for the phones'
@@ -4881,18 +4919,18 @@ mod tests {
             Arc::new(move || {
                 let (on_never_left_heard, owed, never_left_tx) = (heard.clone(), owed.clone(), never_left_tx.clone());
                 let progress = heard.clone();
-                AppLinks::send_on_held_link(
+                AppLinks::send_on_held_link_owed(
                     &dest,
                     payload.clone(),
                     false,
                     heard_by(&heard, "delivered"),
                     heard_by(&heard, "failed"),
                     Some(Arc::new(move |event| progress.lock().unwrap().push(format!("{:?}", event)))),
-                    Some(Arc::new(move || {
+                    Arc::new(move || {
                         on_never_left_heard.lock().unwrap().push("never left".to_string());
                         owed.store(true, Ordering::Release);
                         let _ = never_left_tx.lock().unwrap().send(());
-                    })),
+                    }),
                 )
             })
         };
@@ -4939,7 +4977,7 @@ mod tests {
         reset_registry_for_test();
     }
 
-    // A caller that passes no on_never_left (LXMRouter's PROPAGATED upload)
+    // send_on_held_link, with no never-left (LXMRouter's PROPAGATED upload),
     // sees today's behaviour for the same upload: the advertisement counts
     // as sent though nothing carried it (RNS/Resource.py `__advertise_job`),
     // the Resource is in flight on its link, and its own failure (here its
@@ -4966,7 +5004,6 @@ mod tests {
                 let _ = failed_tx.lock().unwrap().send(());
             }),
             Some(Arc::new(move |event| progress.lock().unwrap().push(format!("{:?}", event)))),
-            None,
         )
         .expect("a Resource is put in flight");
 
@@ -5267,6 +5304,12 @@ mod tests {
         let held = between("pub fn send_on_held_link(", "pub fn status(");
         assert!(held.contains("let watch = TransferWatch::new(on_progress);"));
         assert!(held.contains("Some(on_failed), &watch, on_never_left)"));
+        // LXMRouter's call is unchanged and has no never-left; only the owed
+        // entry point passes one.
+        let plain = between("pub fn send_on_held_link(", "pub fn send_on_held_link_owed(");
+        assert!(plain.contains("on_progress, None)"), "send_on_held_link: no never-left");
+        let owed = between("pub fn send_on_held_link_owed(", "fn send_held(");
+        assert!(owed.contains("on_progress, Some(on_never_left))"));
         // The tier chain's sends have no never-left: both its fires pass None.
         assert_eq!(production.matches("            watch,\n            None,\n        );").count(), 2);
 
