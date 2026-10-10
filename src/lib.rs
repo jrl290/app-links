@@ -962,6 +962,24 @@ impl AppLinks {
     /// Never on the calling thread, so the caller may hold a lock the
     /// callback takes.
     ///
+    /// `on_never_left` is for a caller that owes the upload
+    /// (DESIGN_PRINCIPLES §3: an upload that never left the device, because
+    /// no interface could carry it, is not a failure; the link is kept, and
+    /// it goes again at the next interface up-edge or coming-up). With it, a
+    /// payload over the link MDU whose Resource's first advertisement no
+    /// interface could carry (`Resource::advertise_shared_then_reporting`)
+    /// never left: the Resource is marked ended and cancelled here, the
+    /// link is left as it is, and `on_never_left` runs instead of
+    /// `on_failed`, once, on the advertise thread. Whichever comes first,
+    /// that or the Resource's own conclusion, decides the upload; the other
+    /// then reports nothing. An advertisement that was carried leaves the
+    /// Resource's own completion or failure to decide, as without it (James,
+    /// 2026-10-04 and 2026-10-10). A packet that could not be queued is the
+    /// `Err` below, with or without it. With `None` (LXMRouter's PROPAGATED
+    /// upload) a Resource is today's: its advertisement counts as sent
+    /// whether or not it was carried (RNS/Resource.py `__advertise_job`),
+    /// and its failure after its advertisement retries reaches `on_failed`.
+    ///
     /// Returns `Err` when no active link is held or the packet could not be
     /// queued, in which case no callback fires.
     pub fn send_on_held_link(
@@ -971,13 +989,14 @@ impl AppLinks {
         on_delivered: Arc<dyn Fn() + Send + Sync + 'static>,
         on_failed: Arc<dyn Fn() + Send + Sync + 'static>,
         on_progress: Option<SendProgressCallback>,
+        on_never_left: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
     ) -> Result<(), String> {
         let link = Self::get_handle(dest_hash)
             .filter(|handle| handle.status() == STATE_ACTIVE)
             .ok_or_else(|| format!("no active link held for {}", hexrep(dest_hash, false)))?;
         let delivered = Arc::new(AtomicBool::new(false));
         let watch = TransferWatch::new(on_progress);
-        if Self::fire_on_link(&link, &packed, compress, delivered, on_delivered, Some(on_failed), &watch) {
+        if Self::fire_on_link(&link, &packed, compress, delivered, on_delivered, Some(on_failed), &watch, on_never_left) {
             Ok(())
         } else {
             Err(format!("packet could not be queued on the link to {}", hexrep(dest_hash, false)))
@@ -2199,6 +2218,7 @@ impl AppLinks {
             report.delivered,
             Some(report.failed),
             watch,
+            None,
         );
         if !fired {
             log(
@@ -2324,7 +2344,10 @@ impl AppLinks {
     /// chain `delivered` is the tier's own gate (`TierReport::gate`) and
     /// `SendOutcome` decides between tiers.  `on_outcome_failed` hears this
     /// attempt's own failure event: the receipt's timeout, or the Resource
-    /// concluding without COMPLETE.
+    /// concluding without COMPLETE. `on_never_left` is
+    /// `send_on_held_link`'s, for a Resource only (`fire_resource_on_link`);
+    /// the tier chain passes `None`. A packet no interface could carry is
+    /// `false` here, as before.
     fn fire_on_link(
         link: &LinkHandle,
         packed: &[u8],
@@ -2333,9 +2356,10 @@ impl AppLinks {
         on_delivered: Arc<dyn Fn() + Send + Sync + 'static>,
         on_outcome_failed: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
         watch: &TransferWatch,
+        on_never_left: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
     ) -> bool {
         if link_representation(packed.len()) == LinkRepresentation::Resource {
-            return Self::fire_resource_on_link(link, packed, compress, delivered, on_delivered, on_outcome_failed, watch);
+            return Self::fire_resource_on_link(link, packed, compress, delivered, on_delivered, on_outcome_failed, watch, on_never_left);
         }
         // One link packet: nothing to report until the proof (the reference
         // sets a fixed 0.50 here, LXMF/LXMessage.py `send`).
@@ -2424,6 +2448,12 @@ impl AppLinks {
     /// (`TransferWatch::advertised`) and the Resource's end when it
     /// concludes without delivering (`TransferWatch::ended`), since
     /// 2026-10-01.
+    ///
+    /// With `on_never_left` (`send_on_held_link`'s), the Resource is
+    /// advertised through `Resource::advertise_shared_then_reporting`, and an
+    /// advertisement no interface carried makes the upload never-left
+    /// (`NeverLeft`) instead of leaving it to fail after its retries. Without
+    /// it (the tier chain, LXMRouter), as before.
     fn fire_resource_on_link(
         link: &LinkHandle,
         packed: &[u8],
@@ -2432,6 +2462,7 @@ impl AppLinks {
         on_delivered: Arc<dyn Fn() + Send + Sync + 'static>,
         on_outcome_failed: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
         watch: &TransferWatch,
+        on_never_left: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
     ) -> bool {
         use reticulum_rust::resource::{AutoCompressOption, Resource, ResourceData};
         if !link.is_active() {
@@ -2443,7 +2474,21 @@ impl AppLinks {
         // its end (DESIGN_PRINCIPLES §1, bulk transfers).
         let ended = Arc::new(AtomicBool::new(false));
         let advertised = watch.advertised(delivered.clone(), ended.clone());
+        let never_left = on_never_left.map(|on_never_left| NeverLeft {
+            decided: Arc::new(AtomicBool::new(false)),
+            ended: ended.clone(),
+            on_never_left,
+            what: format!(
+                "Resource upload ({} B) on the link to {}",
+                packed.len(),
+                hexrep(link.cached_destination_hash(), false)
+            ),
+        });
         let concluded = Self::resource_concluded(delivered, on_delivered, watch.ended(ended, on_outcome_failed));
+        let concluded = match &never_left {
+            Some(never_left) => never_left.unless_it_never_left(concluded),
+            None => concluded,
+        };
         match Resource::new_internal(
             Some(ResourceData::Bytes(packed.to_vec())),
             link.clone(),
@@ -2467,7 +2512,19 @@ impl AppLinks {
                 // another Resource on the link), on the advertise thread:
                 // send_on_held_link runs on the caller's thread, which may
                 // hold the very lock the report takes.
-                Resource::advertise_shared_then(Arc::new(Mutex::new(resource)), advertised);
+                match never_left {
+                    // DESIGN_PRINCIPLES §3 (2026-10-06, for a Resource
+                    // 2026-10-10): the same hook also hears whether the
+                    // advertisement was carried.
+                    Some(never_left) => {
+                        let resource = Arc::new(Mutex::new(resource));
+                        Resource::advertise_shared_then_reporting(
+                            resource.clone(),
+                            never_left.on_advertised(resource, advertised),
+                        );
+                    }
+                    None => Resource::advertise_shared_then(Arc::new(Mutex::new(resource)), advertised),
+                }
                 true
             }
             Err(e) => {
@@ -2478,6 +2535,85 @@ impl AppLinks {
                 false
             }
         }
+    }
+}
+
+/// A Resource upload whose first advertisement no interface could carry
+/// never left the device (DESIGN_PRINCIPLES §3: James, 2026-10-06, for a
+/// Resource 2026-10-10). It is the Resource counterpart of a packet that
+/// could not be queued: nothing was sent, so it is not a failure, and the
+/// link is kept. Only for a caller of `send_on_held_link` that passes
+/// `on_never_left`.
+///
+/// One upload has one outcome: `decided` is taken once, by whichever comes
+/// first, this finding (`on_advertised`) or the Resource's own conclusion
+/// (`unless_it_never_left`). An advertisement that was carried takes
+/// nothing here; from then on the Resource's own completion or failure
+/// decides, its advertisement retries included (James, 2026-10-04).
+struct NeverLeft {
+    decided: Arc<AtomicBool>,
+    /// The Resource's `ended` (`TransferWatch::advertised`, `ended`).
+    ended: Arc<AtomicBool>,
+    on_never_left: Arc<dyn Fn() + Send + Sync + 'static>,
+    /// What the log line calls the upload.
+    what: String,
+}
+
+impl NeverLeft {
+    /// The Resource's conclusion callback, run only when the upload has not
+    /// been found never-left first: a Resource cancelled here because it
+    /// never left concludes FAILED, and that is not its failure.
+    fn unless_it_never_left(
+        &self,
+        concluded: Arc<dyn Fn(Arc<Mutex<reticulum_rust::resource::Resource>>) + Send + Sync>,
+    ) -> Arc<dyn Fn(Arc<Mutex<reticulum_rust::resource::Resource>>) + Send + Sync> {
+        let decided = self.decided.clone();
+        Arc::new(move |resource| {
+            if decided.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            concluded(resource);
+        })
+    }
+
+    /// The hook for `Resource::advertise_shared_then_reporting`, on the
+    /// advertise thread without the Resource's lock. Carried: the caller
+    /// hears the advertisement (`advertised`) as without `on_never_left`.
+    /// Not carried, and the Resource has not concluded first: it is marked
+    /// ended (so nothing more is reported of it), cancelled with its own
+    /// cancel (it is FAILED and leaves its link's outgoing list, the watchdog
+    /// stops; the link is not torn down), and the caller hears
+    /// `on_never_left` and never `on_failed`.
+    fn on_advertised(
+        self,
+        resource: Arc<Mutex<reticulum_rust::resource::Resource>>,
+        advertised: Box<dyn FnOnce() + Send + 'static>,
+    ) -> Box<dyn FnOnce(bool) + Send + 'static> {
+        Box::new(move |carried| {
+            if carried {
+                advertised();
+                return;
+            }
+            if self.decided.swap(true, Ordering::AcqRel) {
+                // It concluded first (its link closed under it): that
+                // event decided the upload.
+                return;
+            }
+            self.ended.store(true, Ordering::Release);
+            if let Ok(mut resource) = resource.lock() {
+                resource.cancel();
+            }
+            drop(resource);
+            log(
+                &format!(
+                    "[APP_LINK] {} never left: no interface could carry its first advertisement; \
+                     cancelled here, the link is kept, and it is reported never-left, not failed",
+                    self.what
+                ),
+                LOG_NOTICE, false, false,
+            );
+            (self.on_never_left)();
+        })
     }
 }
 
@@ -2815,6 +2951,7 @@ impl TierLinks for StackTiers<'_> {
             report.delivered,
             Some(report.failed),
             watch,
+            None,
         );
         if !fired {
             log(
@@ -3449,7 +3586,7 @@ mod tests {
         let dest: Vec<u8> = (0u8..16).map(|i| i.wrapping_mul(13)).collect();
         let fired = Arc::new(AtomicBool::new(false));
         let (f1, f2) = (fired.clone(), fired.clone());
-        let f3 = fired.clone();
+        let (f3, f4) = (fired.clone(), fired.clone());
         let result = AppLinks::send_on_held_link(
             &dest,
             vec![1, 2, 3],
@@ -3457,6 +3594,7 @@ mod tests {
             Arc::new(move || f1.store(true, Ordering::Release)),
             Arc::new(move || f2.store(true, Ordering::Release)),
             Some(Arc::new(move |_| f3.store(true, Ordering::Release))),
+            Some(Arc::new(move || f4.store(true, Ordering::Release))),
         );
         assert!(result.is_err());
         assert!(!fired.load(Ordering::Acquire), "no callback without a send");
@@ -4436,6 +4574,330 @@ mod tests {
         assert!(seen.lock().unwrap().is_empty(), "no advertisement went out, so none is reported: {:?}", seen);
     }
 
+    // ── Stage 0 of the distro sync proof: a Resource upload that never left ──
+    //
+    // DESIGN_PRINCIPLES §3 (James, 2026-10-06; for a Resource upload,
+    // 2026-10-10): an upload no interface could carry never left the device.
+    // It is not a failure, the link is kept, and it goes again at the next
+    // interface up-edge or coming-up. For a Resource that is its first
+    // advertisement.
+
+    /// What the callbacks of one upload heard, in order.
+    type UploadHeard = Arc<Mutex<Vec<String>>>;
+
+    fn heard_by(heard: &UploadHeard, what: &'static str) -> Arc<dyn Fn() + Send + Sync + 'static> {
+        let heard = heard.clone();
+        Arc::new(move || heard.lock().unwrap().push(what.to_string()))
+    }
+
+    /// The production pieces `fire_resource_on_link` puts on one Resource
+    /// with `on_never_left`, around a Resource on a bare link that the test
+    /// marks ADVERTISED, as the advertise job has when the hook runs. Every
+    /// callback writes to `heard`, `on_progress` included.
+    fn never_left_resource(
+        heard: &UploadHeard,
+    ) -> (Arc<Mutex<reticulum_rust::resource::Resource>>, Box<dyn FnOnce(bool) + Send + 'static>, Arc<AtomicBool>) {
+        use reticulum_rust::resource::ResourceStatus;
+        let progress = heard.clone();
+        let watch = TransferWatch::new(Some(Arc::new(move |event| {
+            progress.lock().unwrap().push(format!("{:?}", event));
+        })));
+        let delivered = Arc::new(AtomicBool::new(false));
+        let ended = Arc::new(AtomicBool::new(false));
+        let advertised = watch.advertised(delivered.clone(), ended.clone());
+        let never_left = NeverLeft {
+            decided: Arc::new(AtomicBool::new(false)),
+            ended: ended.clone(),
+            on_never_left: heard_by(heard, "never left"),
+            what: "test upload".into(),
+        };
+        let concluded = AppLinks::resource_concluded(
+            delivered.clone(),
+            heard_by(heard, "delivered"),
+            watch.ended(ended.clone(), Some(heard_by(heard, "failed"))),
+        );
+        let mut resource = sending_resource(4, watch.resource_progress(delivered));
+        resource.callback = Some(never_left.unless_it_never_left(concluded));
+        resource.status = ResourceStatus::Advertised;
+        let resource = Arc::new(Mutex::new(resource));
+        let hook = never_left.on_advertised(resource.clone(), advertised);
+        (resource, hook, ended)
+    }
+
+    // An advertisement no interface carried: the upload is never-left, once,
+    // and never failed; nothing is reported to on_progress (its §1 watch
+    // never started); the Resource is ended and cancelled; its link is left
+    // as it was.
+    #[test]
+    fn an_uncarried_advertisement_is_never_left_and_not_failed() {
+        use reticulum_rust::resource::ResourceStatus;
+        let heard: UploadHeard = Arc::new(Mutex::new(Vec::new()));
+        let (resource, hook, ended) = never_left_resource(&heard);
+        let link = resource.lock().unwrap().link.clone();
+        let link_status = link.status();
+
+        hook(false);
+
+        assert_eq!(*heard.lock().unwrap(), vec!["never left".to_string()], "never-left, instead of failed");
+        assert!(ended.load(Ordering::Acquire), "the Resource is marked ended");
+        assert_eq!(resource.lock().unwrap().status, ResourceStatus::Failed, "and cancelled");
+        assert_eq!(link.status(), link_status, "the link is not torn down");
+    }
+
+    // An advertisement that was carried takes nothing from never-left: the
+    // caller hears it advertised, and the Resource's own end decides.
+    #[test]
+    fn a_carried_advertisement_is_left_to_the_resources_own_events() {
+        use reticulum_rust::resource::ResourceStatus;
+        let heard: UploadHeard = Arc::new(Mutex::new(Vec::new()));
+        let (resource, hook, _ended) = never_left_resource(&heard);
+
+        hook(true);
+        assert_eq!(*heard.lock().unwrap(), vec!["Advertised".to_string()]);
+        assert_eq!(resource.lock().unwrap().status, ResourceStatus::Advertised, "not cancelled");
+
+        // Its advertisement goes unanswered through its retries, or its
+        // link closes: it fails, and that is the upload's failure.
+        resource.lock().unwrap().cancel();
+        assert_eq!(
+            *heard.lock().unwrap(),
+            vec!["Advertised".to_string(), "Ended".to_string(), "failed".to_string()],
+        );
+    }
+
+    // The Resource concluded before the hook ran (its link closed between
+    // the advertisement and the hook): its own failure decided the upload,
+    // and the hook finding the advertisement uncarried reports nothing more.
+    #[test]
+    fn a_resource_that_concluded_first_is_decided_by_its_own_end() {
+        let heard: UploadHeard = Arc::new(Mutex::new(Vec::new()));
+        let (resource, hook, _ended) = never_left_resource(&heard);
+
+        resource.lock().unwrap().cancel();
+        hook(false);
+
+        assert_eq!(
+            *heard.lock().unwrap(),
+            vec!["Ended".to_string(), "failed".to_string()],
+            "one outcome: its own failure, then nothing"
+        );
+    }
+
+    /// An interface for a held test link, registered in Transport up or
+    /// down, whose writer hands each frame put on it to the receiver. Taken
+    /// out again, with the link, when it drops.
+    struct HeldLinkOnInterface {
+        dest: Vec<u8>,
+        link: LinkHandle,
+        iface: String,
+    }
+
+    impl HeldLinkOnInterface {
+        /// A keyed, ACTIVE link held for `dest` (as an established
+        /// propagation link is), attached to the interface `iface`, which is
+        /// registered `online` or not.
+        fn new(dest: &[u8], seed: u8, iface: &str, online: bool) -> (Self, mpsc::Receiver<Vec<u8>>) {
+            use reticulum_rust::transport::{InterfaceStub, InterfaceStubConfig};
+            let mut config = InterfaceStubConfig::default();
+            config.name = iface.to_string();
+            config.mode = InterfaceStub::MODE_FULL;
+            config.out = true;
+            config.online = Some(online);
+            Transport::register_interface_stub_config(config);
+            let (tx, frames) = mpsc::channel();
+            let tx = Mutex::new(tx);
+            Transport::register_outbound_handler(
+                iface,
+                Arc::new(move |raw: &[u8]| {
+                    let _ = tx.lock().unwrap().send(raw.to_vec());
+                    true
+                }),
+            );
+
+            let mut link = Link::new_inbound(reticulum_rust::destination::Destination::default()).expect("test link");
+            link.link_id = (0u8..16).map(|i| i.wrapping_mul(seed)).collect();
+            link.attached_interface = Some(iface.to_string());
+            link.state = STATE_ACTIVE;
+            link.status = STATE_ACTIVE;
+            link.rtt = Some(0.1);
+            let now = unix_now() as u64;
+            link.activated_at = Some(now);
+            link.last_inbound = now;
+            link.last_outbound = now;
+            link.last_proof = now;
+            let key: Vec<u8> = (0u8..64).map(|i| i.wrapping_mul(7).wrapping_add(3)).collect();
+            *link.token.lock().unwrap() = Some(reticulum_rust::identity::Token::new(&key).unwrap());
+            link.derived_key = Some(key);
+            let link = LinkHandle::spawn(link);
+            reticulum_rust::link::register_runtime_link_handle(link.clone());
+            REGISTRY.lock().unwrap().links.insert(dest.to_vec(), link.clone());
+            (Self { dest: dest.to_vec(), link, iface: iface.to_string() }, frames)
+        }
+    }
+
+    impl Drop for HeldLinkOnInterface {
+        fn drop(&mut self) {
+            if let Ok(mut reg) = REGISTRY.lock() {
+                reg.links.remove(&self.dest);
+            }
+            self.link.teardown();
+            reticulum_rust::link::unregister_runtime_link(&self.link.link_id());
+            Transport::unregister_outbound_handler(&self.iface);
+            Transport::deregister_interface_stub(&self.iface);
+        }
+    }
+
+    /// The RESOURCE_ADV frames among `frames` within `within`. An
+    /// advertisement nobody answers is sent again by its Resource's own
+    /// watchdog, but never sooner than `Resource::PROCESSING_GRACE` (1 s)
+    /// after it: a window shorter than that sees each Resource's once.
+    fn advertisements(frames: &mpsc::Receiver<Vec<u8>>, within: Duration) -> usize {
+        let until = Instant::now() + within;
+        let mut seen = 0;
+        while let Ok(frame) = frames.recv_timeout(until.saturating_duration_since(Instant::now())) {
+            if frame.get(18) == Some(&packet::RESOURCE_ADV) {
+                seen += 1;
+            }
+        }
+        seen
+    }
+
+    // The short drop of 2026-10-06, for a Resource upload, through
+    // `send_on_held_link` on a real link and a real Resource: the
+    // propagation link is up and its interface is down when the upload is
+    // fired. The upload is never-left, with no failure and no teardown, and
+    // nothing reaches the wire. The owner (here a stand-in for the phones'
+    // outbox) then sends it at the interface's up-edge, on the same link:
+    // it goes once, and the advertisement is on the wire.
+    #[test]
+    fn a_resource_upload_whose_interface_is_down_never_leaves_and_goes_at_the_up_edge() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_registry_for_test();
+        const IFACE: &str = "AppLinksShortDropTest";
+        let dest: Vec<u8> = (0u8..16).map(|i| i.wrapping_mul(29)).collect();
+        let (held, frames) = HeldLinkOnInterface::new(&dest, 223, IFACE, false);
+        let payload = vec![0x5Au8; 2048];
+        assert_eq!(link_representation(payload.len()), LinkRepresentation::Resource);
+
+        let heard: UploadHeard = Arc::new(Mutex::new(Vec::new()));
+        let (never_left_tx, never_left_rx) = mpsc::channel::<()>();
+        let never_left_tx = Mutex::new(never_left_tx);
+        let owed = Arc::new(AtomicBool::new(false));
+        let uploads_at_up_edge = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let upload: Arc<dyn Fn() -> Result<(), String> + Send + Sync> = {
+            let (dest, heard, owed) = (dest.clone(), heard.clone(), owed.clone());
+            let never_left_tx = Arc::new(never_left_tx);
+            Arc::new(move || {
+                let (on_never_left_heard, owed, never_left_tx) = (heard.clone(), owed.clone(), never_left_tx.clone());
+                let progress = heard.clone();
+                AppLinks::send_on_held_link(
+                    &dest,
+                    payload.clone(),
+                    false,
+                    heard_by(&heard, "delivered"),
+                    heard_by(&heard, "failed"),
+                    Some(Arc::new(move |event| progress.lock().unwrap().push(format!("{:?}", event)))),
+                    Some(Arc::new(move || {
+                        on_never_left_heard.lock().unwrap().push("never left".to_string());
+                        owed.store(true, Ordering::Release);
+                        let _ = never_left_tx.lock().unwrap().send(());
+                    })),
+                )
+            })
+        };
+        // The owner's up-edge: an upload that never left goes when an
+        // interface comes back online, once.
+        let (at_up_edge, owed_at_up_edge, counted) = (upload.clone(), owed.clone(), uploads_at_up_edge.clone());
+        Transport::add_interface_up_listener(Arc::new(move |name: &str| {
+            if name == IFACE && owed_at_up_edge.swap(false, Ordering::AcqRel) {
+                counted.fetch_add(1, Ordering::AcqRel);
+                at_up_edge().expect("the link is still held and ACTIVE at the up-edge");
+            }
+        }));
+
+        upload().expect("a Resource is put in flight: Ok, as before");
+        never_left_rx.recv_timeout(Duration::from_secs(5)).expect("the upload is reported never-left");
+        assert_eq!(advertisements(&frames, Duration::from_millis(200)), 0, "nothing reached the wire");
+        assert_eq!(*heard.lock().unwrap(), vec!["never left".to_string()], "never left, not failed, no progress");
+        assert_eq!(held.link.status(), STATE_ACTIVE, "the link is kept");
+        assert!(
+            AppLinks::get_handle(&dest).map_or(false, |h| h.same_link(&held.link)),
+            "and still held"
+        );
+        assert!(held.link.ready_for_new_resource(), "the Resource is cancelled: nothing is in flight on the link");
+
+        Transport::set_interface_online(IFACE, true);
+        let advertised_at_up_edge = Instant::now() + Duration::from_secs(5);
+        let mut advertised = false;
+        while !advertised && Instant::now() < advertised_at_up_edge {
+            advertised = frames
+                .recv_timeout(advertised_at_up_edge.saturating_duration_since(Instant::now()))
+                .map_or(false, |frame| frame.get(18) == Some(&packet::RESOURCE_ADV));
+        }
+        assert!(advertised, "the upload goes at the up-edge: its advertisement is on the wire");
+        assert_eq!(advertisements(&frames, Duration::from_millis(500)), 0, "one upload, one advertisement");
+        assert_eq!(uploads_at_up_edge.load(Ordering::Acquire), 1, "the owner sent it once, at the up-edge");
+        assert!(never_left_rx.recv_timeout(Duration::from_millis(200)).is_err(), "carried: not never-left again");
+        assert_eq!(
+            *heard.lock().unwrap(),
+            vec!["never left".to_string(), "Advertised".to_string()],
+            "the second upload left: its advertisement was reported, and nothing failed"
+        );
+        assert!(!owed.load(Ordering::Acquire));
+        drop(held);
+        reset_registry_for_test();
+    }
+
+    // A caller that passes no on_never_left (LXMRouter's PROPAGATED upload)
+    // sees today's behaviour for the same upload: the advertisement counts
+    // as sent though nothing carried it (RNS/Resource.py `__advertise_job`),
+    // the Resource is in flight on its link, and its own failure (here its
+    // link closing) is the upload's failure.
+    #[test]
+    fn without_on_never_left_an_uncarried_resource_upload_is_as_before() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_registry_for_test();
+        let dest: Vec<u8> = (0u8..16).map(|i| i.wrapping_mul(31)).collect();
+        let (held, frames) = HeldLinkOnInterface::new(&dest, 227, "AppLinksNoNeverLeftTest", false);
+        let heard: UploadHeard = Arc::new(Mutex::new(Vec::new()));
+        let (failed_tx, failed_rx) = mpsc::channel::<()>();
+        let failed_tx = Mutex::new(failed_tx);
+        let failed_heard = heard.clone();
+        let progress = heard.clone();
+
+        AppLinks::send_on_held_link(
+            &dest,
+            vec![0x5Au8; 2048],
+            false,
+            heard_by(&heard, "delivered"),
+            Arc::new(move || {
+                failed_heard.lock().unwrap().push("failed".to_string());
+                let _ = failed_tx.lock().unwrap().send(());
+            }),
+            Some(Arc::new(move |event| progress.lock().unwrap().push(format!("{:?}", event)))),
+            None,
+        )
+        .expect("a Resource is put in flight");
+
+        let advertised = Instant::now() + Duration::from_secs(5);
+        while heard.lock().unwrap().is_empty() && Instant::now() < advertised {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(*heard.lock().unwrap(), vec!["Advertised".to_string()], "advertised, as today");
+        assert_eq!(advertisements(&frames, Duration::from_millis(200)), 0, "though nothing carried it");
+        assert!(!held.link.ready_for_new_resource(), "the Resource is in flight on its link, with its retries");
+        assert!(failed_rx.try_recv().is_err(), "not failed: its own events decide");
+
+        held.link.teardown();
+        failed_rx.recv_timeout(Duration::from_secs(5)).expect("its link closing fails it");
+        assert_eq!(
+            *heard.lock().unwrap(),
+            vec!["Advertised".to_string(), "Ended".to_string(), "failed".to_string()],
+        );
+        drop(held);
+        reset_registry_for_test();
+    }
+
     // §O6 — only more of the message sent is activity: a request that
     // brings only resends leaves the fraction where it was.
     #[test]
@@ -4602,10 +5064,21 @@ mod tests {
             "the delivery Resource concludes through the hook that reports its end"
         );
         assert!(
-            resource.contains("Resource::advertise_shared_then(Arc::new(Mutex::new(resource)), advertised);")
+            resource.contains("None => Resource::advertise_shared_then(Arc::new(Mutex::new(resource)), advertised),")
                 && !resource.contains("Resource::advertise_shared("),
             "the delivery Resource is advertised through the hook that reports its advertisement"
         );
+        // DESIGN_PRINCIPLES §3 (2026-10-06; a Resource, 2026-10-10): with
+        // `on_never_left`, the same report also hears whether the
+        // advertisement was carried, and the Resource's conclusion is
+        // decided against that finding, once.
+        assert!(
+            resource.contains("never_left.on_advertised(resource, advertised),")
+                && resource.contains("Resource::advertise_shared_then_reporting("),
+            "with on_never_left the advertisement report hears whether it was carried"
+        );
+        assert!(resource.contains("Some(never_left) => never_left.unless_it_never_left(concluded),"));
+        assert!(resource.contains("None => concluded,"), "without on_never_left the conclusion is as before");
         assert!(
             resource.contains("Some(concluded),\n            Some(progress),"),
             "the delivery Resource's progress_callback (after `callback`) must be the watch's, not None"
@@ -4633,7 +5106,9 @@ mod tests {
 
         let held = between("pub fn send_on_held_link(", "pub fn status(");
         assert!(held.contains("let watch = TransferWatch::new(on_progress);"));
-        assert!(held.contains("Some(on_failed), &watch)"));
+        assert!(held.contains("Some(on_failed), &watch, on_never_left)"));
+        // The tier chain's sends have no never-left: both its fires pass None.
+        assert_eq!(production.matches("            watch,\n            None,\n        );").count(), 2);
 
         let send = between("pub fn send_with_compression(", "pub fn send_with_spec(");
         assert!(send.contains("on_progress,\n                );"), "the caller's callback reaches the tier chain");
