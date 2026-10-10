@@ -406,6 +406,37 @@ impl ResourceSilenceWatch {
     }
 }
 
+/// A point in the sequence of Transport's interface up-edges
+/// (`Transport::interface_up_edges`), for an owner of uploads that never
+/// left (DESIGN_PRINCIPLES §3, James 2026-10-06: such an upload goes when an
+/// interface comes back online). See [`AppLinks::send_on_held_link_owed`].
+///
+/// The owner learns that an upload never left a moment after no interface
+/// carried it: `on_never_left` runs on the advertise thread after its
+/// Resource is cancelled, and a packet's `Err` returns after Transport
+/// refused it. An up-edge in between reaches the owner's up-edge listener
+/// while the upload is not yet owed, and the link stays up, so no coming-up
+/// follows. So the owner takes a mark before each send, records a never-left
+/// upload as owed first, and then asks the mark: when an interface came up
+/// since, that up-edge was this upload's, and it goes now. An ordering check
+/// at an event; no timer and no retry: each send answers one up-edge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UpEdgeMark(u64);
+
+impl UpEdgeMark {
+    /// The mark to take just before a send.
+    pub fn now() -> Self {
+        Self(Transport::interface_up_edges())
+    }
+
+    /// Whether an interface has come up since the mark was taken. Ask it only
+    /// after the upload is recorded as owed (with sequentially consistent
+    /// atomics, or under the lock the up-edge listener takes it with).
+    pub fn came_up_since(&self) -> bool {
+        Transport::interface_up_edges() != self.0
+    }
+}
+
 /// Per-destination lifecycle mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum LinkMode {
@@ -1089,6 +1120,20 @@ impl AppLinks {
     /// Resource's own completion or failure to decide, as
     /// `send_on_held_link` does (James, 2026-10-04 and 2026-10-10). A packet
     /// that could not be queued is the `Err`, as there.
+    ///
+    /// The owner sends a never-left upload at the next interface up-edge it
+    /// hears (`Transport::add_interface_up_listener`), and must not miss one
+    /// that came before it heard never-left ([`UpEdgeMark`]):
+    /// 1. take `UpEdgeMark::now()` just before calling this;
+    /// 2. on never-left (`on_never_left`, or the `Err` that the packet could
+    ///    not be queued), record the upload as owed, and only then ask the
+    ///    mark's `came_up_since()`; when it is true, take the owed upload and
+    ///    send it now, with a new mark;
+    /// 3. at each up-edge, take the owed upload and send it.
+    ///
+    /// Steps 2 and 3 take the owed upload the same way (one atomic swap, or
+    /// under one lock), so it goes once. Each send answers one up-edge, so a
+    /// never-left for any other reason waits for the next up-edge.
     pub fn send_on_held_link_owed(
         dest_hash: &[u8],
         packed: Vec<u8>,
@@ -2701,7 +2746,13 @@ impl NeverLeft {
     /// ended (so nothing more is reported of it), cancelled with its own
     /// cancel (it is FAILED and leaves its link's outgoing list, the watchdog
     /// stops; the link is not torn down), and the caller hears
-    /// `on_never_left` and never `on_failed`.
+    /// `on_never_left` and never `on_failed`. Cancelled before the caller
+    /// hears it, so a send the caller makes at once (`UpEdgeMark`) finds
+    /// the link free of it. Its cancel sends RESOURCE_ICL on the active link,
+    /// as RNS/Resource.py `cancel` does; that goes the way the advertisement
+    /// went (normally nowhere, logged as one more packet no interface could
+    /// process), and a receiver that does hear it holds no Resource by that
+    /// hash, because no advertisement reached it, and ignores it.
     fn on_advertised(
         self,
         resource: Arc<Mutex<reticulum_rust::resource::Resource>>,
@@ -4891,6 +4942,119 @@ mod tests {
         seen
     }
 
+    /// A stand-in for the phones' distro outbox, owning one upload the way
+    /// `send_on_held_link_owed` asks an owner to: a mark before each send;
+    /// a never-left recorded as owed first and then checked against its
+    /// mark; the owed upload taken by one swap, at an up-edge of its
+    /// interface or at that check.
+    struct OwedUpload {
+        dest: Vec<u8>,
+        iface: &'static str,
+        payload: Vec<u8>,
+        heard: UploadHeard,
+        owed: AtomicBool,
+        sends: std::sync::atomic::AtomicUsize,
+        sends_at_up_edge: std::sync::atomic::AtomicUsize,
+        sends_at_mark: std::sync::atomic::AtomicUsize,
+        never_left: Mutex<mpsc::Sender<()>>,
+        /// Each up-edge of `iface` the owner heard, and whether it found the
+        /// upload owed then.
+        up_edges: Mutex<mpsc::Sender<bool>>,
+        /// Run once, at the first never-left, before it is recorded as owed.
+        before_owed: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+
+    impl OwedUpload {
+        fn new(
+            dest: &[u8],
+            iface: &'static str,
+            payload: Vec<u8>,
+        ) -> (Arc<Self>, mpsc::Receiver<()>, mpsc::Receiver<bool>) {
+            let (never_left, never_left_rx) = mpsc::channel();
+            let (up_edges, up_edges_rx) = mpsc::channel();
+            let owner = Arc::new(Self {
+                dest: dest.to_vec(),
+                iface,
+                payload,
+                heard: Arc::new(Mutex::new(Vec::new())),
+                owed: AtomicBool::new(false),
+                sends: Default::default(),
+                sends_at_up_edge: Default::default(),
+                sends_at_mark: Default::default(),
+                never_left: Mutex::new(never_left),
+                up_edges: Mutex::new(up_edges),
+                before_owed: Mutex::new(None),
+            });
+            // The owner's up-edge (Transport's listeners are never taken out
+            // again: this one holds the owner weakly).
+            let listening = Arc::downgrade(&owner);
+            Transport::add_interface_up_listener(Arc::new(move |name: &str| {
+                if let Some(owner) = listening.upgrade() {
+                    owner.up_edge(name);
+                }
+            }));
+            (owner, never_left_rx, up_edges_rx)
+        }
+
+        fn send(self: &Arc<Self>) -> Result<(), String> {
+            let mark = UpEdgeMark::now();
+            self.sends.fetch_add(1, Ordering::SeqCst);
+            let (owner, progress) = (self.clone(), self.heard.clone());
+            AppLinks::send_on_held_link_owed(
+                &self.dest,
+                self.payload.clone(),
+                false,
+                heard_by(&self.heard, "delivered"),
+                heard_by(&self.heard, "failed"),
+                Some(Arc::new(move |event| progress.lock().unwrap().push(format!("{:?}", event)))),
+                Arc::new(move || owner.never_left(mark)),
+            )
+        }
+
+        fn never_left(self: &Arc<Self>, mark: UpEdgeMark) {
+            self.heard.lock().unwrap().push("never left".to_string());
+            let before_owed = self.before_owed.lock().unwrap().take();
+            if let Some(before_owed) = before_owed {
+                before_owed();
+            }
+            self.owed.store(true, Ordering::SeqCst);
+            let _ = self.never_left.lock().unwrap().send(());
+            if mark.came_up_since() && self.owed.swap(false, Ordering::SeqCst) {
+                self.sends_at_mark.fetch_add(1, Ordering::SeqCst);
+                self.send().expect("the link is still held and ACTIVE");
+            }
+        }
+
+        fn up_edge(self: &Arc<Self>, name: &str) {
+            if name != self.iface {
+                return;
+            }
+            let took = self.owed.swap(false, Ordering::SeqCst);
+            if took {
+                self.sends_at_up_edge.fetch_add(1, Ordering::SeqCst);
+                self.send().expect("the link is still held and ACTIVE at the up-edge");
+            }
+            let _ = self.up_edges.lock().unwrap().send(took);
+        }
+
+        fn heard(&self) -> Vec<String> {
+            self.heard.lock().unwrap().clone()
+        }
+    }
+
+    /// Waits up to 5 s for a RESOURCE_ADV among `frames`.
+    fn an_advertisement(frames: &mpsc::Receiver<Vec<u8>>) -> bool {
+        let until = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < until {
+            match frames.recv_timeout(until.saturating_duration_since(Instant::now())) {
+                Ok(frame) if frame.get(18) == Some(&packet::RESOURCE_ADV) => return true,
+                Ok(_) => {}
+                Err(_) => return false,
+            }
+        }
+        false
+    }
+
     // The short drop of 2026-10-06, for a Resource upload, through
     // `send_on_held_link_owed` on a real link and a real Resource: the
     // propagation link is up and its interface is down when the upload is
@@ -4907,72 +5071,74 @@ mod tests {
         let (held, frames) = HeldLinkOnInterface::new(&dest, 223, IFACE, false);
         let payload = vec![0x5Au8; 2048];
         assert_eq!(link_representation(payload.len()), LinkRepresentation::Resource);
+        let (owner, never_left_rx, up_edges_rx) = OwedUpload::new(&dest, IFACE, payload);
 
-        let heard: UploadHeard = Arc::new(Mutex::new(Vec::new()));
-        let (never_left_tx, never_left_rx) = mpsc::channel::<()>();
-        let never_left_tx = Mutex::new(never_left_tx);
-        let owed = Arc::new(AtomicBool::new(false));
-        let uploads_at_up_edge = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let upload: Arc<dyn Fn() -> Result<(), String> + Send + Sync> = {
-            let (dest, heard, owed) = (dest.clone(), heard.clone(), owed.clone());
-            let never_left_tx = Arc::new(never_left_tx);
-            Arc::new(move || {
-                let (on_never_left_heard, owed, never_left_tx) = (heard.clone(), owed.clone(), never_left_tx.clone());
-                let progress = heard.clone();
-                AppLinks::send_on_held_link_owed(
-                    &dest,
-                    payload.clone(),
-                    false,
-                    heard_by(&heard, "delivered"),
-                    heard_by(&heard, "failed"),
-                    Some(Arc::new(move |event| progress.lock().unwrap().push(format!("{:?}", event)))),
-                    Arc::new(move || {
-                        on_never_left_heard.lock().unwrap().push("never left".to_string());
-                        owed.store(true, Ordering::Release);
-                        let _ = never_left_tx.lock().unwrap().send(());
-                    }),
-                )
-            })
-        };
-        // The owner's up-edge: an upload that never left goes when an
-        // interface comes back online, once.
-        let (at_up_edge, owed_at_up_edge, counted) = (upload.clone(), owed.clone(), uploads_at_up_edge.clone());
-        Transport::add_interface_up_listener(Arc::new(move |name: &str| {
-            if name == IFACE && owed_at_up_edge.swap(false, Ordering::AcqRel) {
-                counted.fetch_add(1, Ordering::AcqRel);
-                at_up_edge().expect("the link is still held and ACTIVE at the up-edge");
-            }
-        }));
-
-        upload().expect("a Resource is put in flight: Ok, as before");
+        owner.send().expect("a Resource is put in flight: Ok, as before");
         never_left_rx.recv_timeout(Duration::from_secs(5)).expect("the upload is reported never-left");
         assert_eq!(advertisements(&frames, Duration::from_millis(200)), 0, "nothing reached the wire");
-        assert_eq!(*heard.lock().unwrap(), vec!["never left".to_string()], "never left, not failed, no progress");
+        assert_eq!(owner.heard(), vec!["never left".to_string()], "never left, not failed, no progress");
         assert_eq!(held.link.status(), STATE_ACTIVE, "the link is kept");
         assert!(
             AppLinks::get_handle(&dest).map_or(false, |h| h.same_link(&held.link)),
             "and still held"
         );
         assert!(held.link.ready_for_new_resource(), "the Resource is cancelled: nothing is in flight on the link");
+        assert!(owner.owed.load(Ordering::SeqCst), "no interface came up since its mark: it is owed and waits");
 
         Transport::set_interface_online(IFACE, true);
-        let advertised_at_up_edge = Instant::now() + Duration::from_secs(5);
-        let mut advertised = false;
-        while !advertised && Instant::now() < advertised_at_up_edge {
-            advertised = frames
-                .recv_timeout(advertised_at_up_edge.saturating_duration_since(Instant::now()))
-                .map_or(false, |frame| frame.get(18) == Some(&packet::RESOURCE_ADV));
-        }
-        assert!(advertised, "the upload goes at the up-edge: its advertisement is on the wire");
+        assert_eq!(up_edges_rx.recv_timeout(Duration::from_secs(5)), Ok(true), "the owner took it at the up-edge");
+        assert!(an_advertisement(&frames), "the upload goes at the up-edge: its advertisement is on the wire");
         assert_eq!(advertisements(&frames, Duration::from_millis(500)), 0, "one upload, one advertisement");
-        assert_eq!(uploads_at_up_edge.load(Ordering::Acquire), 1, "the owner sent it once, at the up-edge");
+        assert_eq!(owner.sends.load(Ordering::SeqCst), 2);
+        assert_eq!(owner.sends_at_up_edge.load(Ordering::SeqCst), 1, "the owner sent it once, at the up-edge");
+        assert_eq!(owner.sends_at_mark.load(Ordering::SeqCst), 0);
         assert!(never_left_rx.recv_timeout(Duration::from_millis(200)).is_err(), "carried: not never-left again");
         assert_eq!(
-            *heard.lock().unwrap(),
+            owner.heard(),
             vec!["never left".to_string(), "Advertised".to_string()],
             "the second upload left: its advertisement was reported, and nothing failed"
         );
-        assert!(!owed.load(Ordering::Acquire));
+        assert!(!owner.owed.load(Ordering::SeqCst));
+        drop(held);
+        reset_registry_for_test();
+    }
+
+    // The same short drop, with the interface back up after Transport found
+    // it down and before the owner recorded the upload as owed: the owner's
+    // up-edge listener hears the up-edge with nothing owed, and the link
+    // stays up, so no coming-up follows. The owner's check of its mark
+    // (`UpEdgeMark`, after recording the upload owed) is what sends it: once,
+    // at once, on the same link.
+    #[test]
+    fn an_up_edge_before_the_never_left_is_recorded_still_sends_the_upload_once() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_registry_for_test();
+        const IFACE: &str = "AppLinksEarlyUpEdgeTest";
+        let dest: Vec<u8> = (0u8..16).map(|i| i.wrapping_mul(37)).collect();
+        let (held, frames) = HeldLinkOnInterface::new(&dest, 229, IFACE, false);
+        let (owner, never_left_rx, up_edges_rx) = OwedUpload::new(&dest, IFACE, vec![0x5Au8; 2048]);
+        let (early_tx, early_rx) = mpsc::channel();
+        *owner.before_owed.lock().unwrap() = Some(Box::new(move || {
+            Transport::set_interface_online(IFACE, true);
+            let _ = early_tx.send(up_edges_rx.recv_timeout(Duration::from_secs(5)));
+        }));
+
+        owner.send().expect("a Resource is put in flight");
+        assert_eq!(
+            early_rx.recv_timeout(Duration::from_secs(10)).expect("the never-left is heard"),
+            Ok(false),
+            "the owner's listener heard the up-edge while nothing was owed"
+        );
+        never_left_rx.recv_timeout(Duration::from_secs(5)).expect("then the upload is recorded never-left");
+        assert!(an_advertisement(&frames), "the mark knows the up-edge came: the upload goes, on the wire");
+        assert_eq!(advertisements(&frames, Duration::from_millis(500)), 0, "once");
+        assert_eq!(owner.sends.load(Ordering::SeqCst), 2);
+        assert_eq!(owner.sends_at_mark.load(Ordering::SeqCst), 1, "sent at the mark's check");
+        assert_eq!(owner.sends_at_up_edge.load(Ordering::SeqCst), 0);
+        assert!(never_left_rx.recv_timeout(Duration::from_millis(200)).is_err(), "carried: not never-left again");
+        assert_eq!(owner.heard(), vec!["never left".to_string(), "Advertised".to_string()]);
+        assert!(!owner.owed.load(Ordering::SeqCst));
+        assert_eq!(held.link.status(), STATE_ACTIVE, "the link is kept");
         drop(held);
         reset_registry_for_test();
     }
