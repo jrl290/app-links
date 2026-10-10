@@ -329,61 +329,104 @@ pub type SendProgressCallback = Arc<dyn Fn(SendProgress) + Send + Sync + 'static
 /// It starts at the Resource's first event (its `Advertised`, or on a fast
 /// link a `Fraction` that came first), measures the silence before each
 /// later event, and stops at `Ended` or the delivery. A silence over the
-/// limit is asserted when it ends, at the next event: no timer runs
+/// limit is found when it ends, at the next event: no timer runs
 /// (DESIGN_PRINCIPLES §4), and every Resource ends with one of those
-/// events. Asserted as LXMRouter's twin and `send_assertion` assert (§1:
-/// panic in debug, `[SEND-ASSERT]` and an ERROR line in release). The debug
-/// panic is on the thread that reported the event, a Resource or link
-/// thread, as `send_assertion`'s `link.establish` panics on the link's own
-/// thread. It decides nothing: it holds no callback of the send, nothing
-/// reads it back, and in release it changes no state.
+/// events.
+///
+/// Asserted as §1 asks, "Panic at the end" (James, 2026-10-10). Where it is
+/// found, in every build, it is logged as LXMRouter's twin and
+/// `send_assertion` log one (`[SEND-ASSERT]` and an ERROR line) and
+/// recorded here; nothing panics there. A `Fraction` and an `Ended` reach
+/// the watch with the Resource's lock held (Reticulum-rust resource.rs
+/// `request` calls `progress_callback` inside `&mut self`, and link.rs
+/// serves the request under `resource_arc.lock()`); a panic there poisoned
+/// that lock, the next `if let Ok(..) = lock()` skipped, and the upload
+/// stalled until its link closed: the watch decided the send. In a debug
+/// build the recorded violations panic at the owner's end point,
+/// [`Self::finish`], which the owner calls last, once it has recorded and
+/// reported the upload's outcome; the panic runs on a thread of its own
+/// ([`assert_after_the_outcome`]). It decides nothing: it holds no callback
+/// of the send, nothing reads it back, and it changes no state of the send.
 pub struct ResourceSilenceWatch {
     label: String,
     /// When the watched Resource last showed progress; `None` when nothing
     /// is being watched.
     last: Mutex<Option<Instant>>,
+    /// The §1 violations logged where they were found, for the debug panic
+    /// at the owner's end point ([`Self::finish`], which takes them).
+    violations: Mutex<Vec<String>>,
     sink: Arc<dyn Fn(&str) + Send + Sync + 'static>,
+    /// The clock events are timed by: `Instant::now`, but in tests.
+    clock: Arc<dyn Fn() -> Instant + Send + Sync + 'static>,
 }
 
 impl ResourceSilenceWatch {
     /// A watch whose violations name the upload `label`, asserted (§1).
     pub fn new(label: impl Into<String>) -> Arc<Self> {
-        Self::with_sink(label, Arc::new(Self::assert_violation))
+        Self::with_sink_and_clock(label, Arc::new(Self::log_violation), Arc::new(Instant::now))
     }
 
-    /// §1: panic in debug; `[SEND-ASSERT]` and an ERROR line in release,
-    /// with no state change (bulk transfers: never used to fail the send).
-    fn assert_violation(line: &str) {
+    /// §1 where a violation is found, in every build: `[SEND-ASSERT]` and an
+    /// ERROR line, with no state change (bulk transfers: never used to fail
+    /// the send). The debug panic is not made here, where a Resource's lock
+    /// can be held, but at the owner's end point ([`Self::finish`]).
+    fn log_violation(line: &str) {
         // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
-        #[cfg(debug_assertions)]
-        {
-            log(line, reticulum_rust::LOG_ERROR, false, false);
-            panic!("{}", line);
-        }
-        #[cfg(not(debug_assertions))]
-        {
-            eprintln!("[SEND-ASSERT] {}", line);
-            log(line, reticulum_rust::LOG_ERROR, false, false);
-        }
+        eprintln!("[SEND-ASSERT] {}", line);
+        log(line, reticulum_rust::LOG_ERROR, false, false);
     }
 
-    /// A watch whose violations go to `sink` (tests).
-    fn with_sink(label: impl Into<String>, sink: Arc<dyn Fn(&str) + Send + Sync + 'static>) -> Arc<Self> {
-        Arc::new(Self { label: label.into(), last: Mutex::new(None), sink })
+    /// A watch whose violations go to `sink`, timed by `clock`
+    /// (`ResourceSilenceWatch::new`, and tests).
+    fn with_sink_and_clock(
+        label: impl Into<String>,
+        sink: Arc<dyn Fn(&str) + Send + Sync + 'static>,
+        clock: Arc<dyn Fn() -> Instant + Send + Sync + 'static>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            label: label.into(),
+            last: Mutex::new(None),
+            violations: Mutex::new(Vec::new()),
+            sink,
+            clock,
+        })
     }
 
     /// The `on_progress` to pass to `send_on_held_link`.
     pub fn on_progress(self: &Arc<Self>) -> SendProgressCallback {
         let watch = Arc::clone(self);
         Arc::new(move |event| {
-            watch.note(event, Instant::now());
+            watch.note(event, (watch.clock)());
         })
     }
 
     /// The send was delivered (its `on_delivered`): the Resource's last
-    /// progress, its proof. The watch stops.
+    /// progress, its proof. The watch stops. Call [`Self::finish`] after it,
+    /// once the delivery is recorded and reported.
     pub fn delivered(&self) {
-        self.stop(Instant::now(), "delivered");
+        self.stop((self.clock)(), "delivered");
+    }
+
+    /// The owner's end point (DESIGN_PRINCIPLES §1, bulk transfers; James,
+    /// 2026-10-10, "Panic at the end"). The owner calls it last, once it has
+    /// recorded and reported the upload's outcome, as the last thing it does
+    /// in whichever of these concludes the upload: its `on_delivered` (after
+    /// [`Self::delivered`] and its own record of the delivery), its
+    /// `on_failed`, its `on_never_left`, or after a send that returned `Err`.
+    /// The watch stops (nothing is measured up to this call), and the
+    /// violations it logged are taken: in a debug build, if there are any,
+    /// they panic on a thread of their own ([`assert_after_the_outcome`]),
+    /// which holds no lock and runs nothing after the panic; so this may be
+    /// called from those callbacks although they run with the Resource's
+    /// lock held. In a release build nothing more happens (each violation
+    /// was logged where it was found), and it returns `None`.
+    ///
+    /// Returns the thread the debug panic runs on; the owner need not join
+    /// it (tests do).
+    pub fn finish(&self) -> Option<std::thread::JoinHandle<()>> {
+        self.last.lock().unwrap_or_else(|p| p.into_inner()).take();
+        let violations = std::mem::take(&mut *self.violations.lock().unwrap_or_else(|p| p.into_inner()));
+        assert_after_the_outcome(violations)
     }
 
     /// One event of the watched Resource at `at`. Returns the silence it
@@ -406,12 +449,15 @@ impl ResourceSilenceWatch {
         self.over_limit(at.saturating_duration_since(previous), how)
     }
 
+    /// A silence over the §1 limit is logged (the sink) and recorded for the
+    /// end point ([`Self::finish`]); this may run with the Resource's lock
+    /// held, so it never panics.
     fn over_limit(&self, silence: Duration, how: &str) -> Option<Duration> {
         if silence.as_secs_f64() <= reticulum_rust::send_assertion::SEND_LATENCY_LIMIT_SECS {
             return None;
         }
         // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
-        (self.sink)(&format!(
+        let line = format!(
             "DESIGN_PRINCIPLES §1 VIOLATION: {} Resource transfer silent for {:.2}s, {} \
              (limit {:.1}s between progress events; total time is not measured). \
              Never used to fail the send: the Resource's own events decide the upload. FIX THE CODE.",
@@ -419,8 +465,71 @@ impl ResourceSilenceWatch {
             silence.as_secs_f64(),
             how,
             reticulum_rust::send_assertion::SEND_LATENCY_LIMIT_SECS,
-        ));
+        );
+        (self.sink)(&line);
+        self.violations.lock().unwrap_or_else(|p| p.into_inner()).push(line);
         Some(silence)
+    }
+}
+
+/// DESIGN_PRINCIPLES §1, bulk transfers (James, 2026-10-10, "Panic at the
+/// end"): the debug panic for the §1 violations one upload recorded, made
+/// once its owner has decided the upload's outcome and recorded and
+/// reported it. [`ResourceSilenceWatch::finish`] and LXMRouter's
+/// `process_outbound` (for a message it lets go of) call it.
+///
+/// A violation is logged where it is found, in every build, and recorded;
+/// it is never panicked on there. There a Resource's lock is held (a
+/// `Fraction` or `Ended`), or LXMRouter's and the message's (the router's
+/// pass): a panic poisons that lock, the next `if let Ok(..) = lock()`
+/// skips, and the upload, or every later send, stalls, so the assertion
+/// would decide the send, which §1 forbids for bulk transfers ("never used
+/// to fail the send").
+///
+/// In a debug build, when `violations` is not empty, the panic runs on a
+/// thread of its own, started here, and the caller goes on. That thread has
+/// taken no lock, so it holds none of the Resource's, the link's or the
+/// caller's when it panics, and poisons nothing; and the panic is all it
+/// runs, so nothing that bookkeeping needs comes after it, for this upload
+/// or any other. That is what lets the end point be called from where the
+/// outcome is handled, which for a Resource upload is a callback under the
+/// Resource's lock. Under `panic = "abort"` the process ends there, after
+/// the outcome was recorded. Returns that thread (tests join it to see the
+/// panic); a caller need not join it.
+///
+/// In a release build it does nothing and returns `None`: each violation
+/// was logged where it was found (`[SEND-ASSERT]` and an ERROR line).
+pub fn assert_after_the_outcome(violations: Vec<String>) -> Option<std::thread::JoinHandle<()>> {
+    if violations.is_empty() {
+        return None;
+    }
+    // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+    #[cfg(debug_assertions)]
+    {
+        let report = violations.join("\n");
+        match std::thread::Builder::new()
+            .name("s1-assert-after-outcome".into())
+            .spawn(move || panic!("{}", report))
+        {
+            Ok(thread) => Some(thread),
+            Err(e) => {
+                log(
+                    &format!(
+                        "DESIGN_PRINCIPLES §1: the debug panic for {} logged violation(s) could not start its thread: {}",
+                        violations.len(),
+                        e
+                    ),
+                    reticulum_rust::LOG_ERROR,
+                    false,
+                    false,
+                );
+                None
+            }
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        None
     }
 }
 
@@ -1100,7 +1209,8 @@ impl AppLinks {
     /// without delivering ([`SendProgress`]); a packet reports nothing.
     /// Never on the calling thread, so the caller may hold a lock the
     /// callback takes. [`ResourceSilenceWatch`] is a §1 watch a caller can
-    /// pass here.
+    /// pass here; its owner then calls [`ResourceSilenceWatch::finish`] last
+    /// wherever it concludes the upload.
     ///
     /// A payload over the link MDU goes as a Resource whose advertisement
     /// counts as sent whether or not an interface carried it
@@ -5215,10 +5325,97 @@ mod tests {
     fn recording_silence_watch() -> (Arc<ResourceSilenceWatch>, Arc<Mutex<Vec<String>>>) {
         let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = lines.clone();
-        let watch = ResourceSilenceWatch::with_sink("distro upload", Arc::new(move |line: &str| {
-            sink.lock().unwrap().push(line.to_string());
-        }));
+        let watch = ResourceSilenceWatch::with_sink_and_clock(
+            "distro upload",
+            Arc::new(move |line: &str| {
+                sink.lock().unwrap().push(line.to_string());
+            }),
+            Arc::new(Instant::now),
+        );
         (watch, lines)
+    }
+
+    /// A clock the test moves on by hand, and the reading of it a watch is
+    /// timed by.
+    fn test_clock() -> (Arc<Mutex<Instant>>, Arc<dyn Fn() -> Instant + Send + Sync + 'static>) {
+        let now = Arc::new(Mutex::new(Instant::now()));
+        let read = now.clone();
+        (now, Arc::new(move || *read.lock().unwrap()))
+    }
+
+    fn advance(now: &Mutex<Instant>, secs: f64) {
+        *now.lock().unwrap() += Duration::from_secs_f64(secs);
+    }
+
+    /// Where the owner's end point (`ResourceSilenceWatch::finish`) left
+    /// the thread its debug panic runs on.
+    type EndPoint = Arc<Mutex<Option<std::thread::JoinHandle<()>>>>;
+
+    /// One upload as `fire_resource_on_link` builds it for
+    /// `send_on_held_link` (no never-left), on a bare test link, the Resource
+    /// ADVERTISED, with its owner's §1 watch as `on_progress`, timed by a
+    /// test clock, its violations going to `sink`. The owner does what
+    /// `finish` asks: on delivery the watch's `delivered`, then its own
+    /// record ("delivered"); on failure its own record ("failed"); then, last,
+    /// `finish`, whose thread it keeps in the `EndPoint`. `heard` has every
+    /// event and record in order. Returns the advertise hook too.
+    fn watched_upload(
+        label: &str,
+        sink: Arc<dyn Fn(&str) + Send + Sync + 'static>,
+    ) -> (
+        Arc<Mutex<reticulum_rust::resource::Resource>>,
+        Box<dyn FnOnce() + Send + 'static>,
+        Arc<Mutex<Instant>>,
+        UploadHeard,
+        EndPoint,
+    ) {
+        use reticulum_rust::resource::ResourceStatus;
+        let (now, clock) = test_clock();
+        let watch = ResourceSilenceWatch::with_sink_and_clock(label, sink, clock);
+        let heard: UploadHeard = Arc::new(Mutex::new(Vec::new()));
+        let end: EndPoint = Arc::new(Mutex::new(None));
+        let on_progress: SendProgressCallback = {
+            let heard = heard.clone();
+            let watched = watch.on_progress();
+            Arc::new(move |event| {
+                heard.lock().unwrap().push(format!("{:?}", event));
+                watched(event);
+            })
+        };
+        let on_delivered: Arc<dyn Fn() + Send + Sync + 'static> = {
+            let (heard, watch, end) = (heard.clone(), watch.clone(), end.clone());
+            Arc::new(move || {
+                watch.delivered();
+                heard.lock().unwrap().push("delivered".to_string());
+                *end.lock().unwrap() = watch.finish();
+            })
+        };
+        let on_failed: Arc<dyn Fn() + Send + Sync + 'static> = {
+            let (heard, watch, end) = (heard.clone(), watch.clone(), end.clone());
+            Arc::new(move || {
+                heard.lock().unwrap().push("failed".to_string());
+                *end.lock().unwrap() = watch.finish();
+            })
+        };
+        let transfer = TransferWatch::new(Some(on_progress));
+        let delivered = Arc::new(AtomicBool::new(false));
+        let ended = Arc::new(AtomicBool::new(false));
+        let advertised = transfer.advertised(delivered.clone(), ended.clone());
+        let concluded = AppLinks::resource_concluded(delivered.clone(), on_delivered, transfer.ended(ended, Some(on_failed)));
+        let mut resource = sending_resource(4, transfer.resource_progress(delivered));
+        resource.callback = Some(concluded);
+        resource.status = ResourceStatus::Advertised;
+        (Arc::new(Mutex::new(resource)), advertised, now, heard, end)
+    }
+
+    /// The Resource's proof, as link.rs hands it over: under the Resource's
+    /// lock, `validate_proof` marks it COMPLETE and runs its callback inside
+    /// `&mut self`.
+    fn prove(resource: &Arc<Mutex<reticulum_rust::resource::Resource>>) {
+        let mut r = resource.lock().unwrap();
+        r.status = reticulum_rust::resource::ResourceStatus::Complete;
+        let callback = r.callback.clone().expect("its conclusion callback");
+        callback(Arc::new(Mutex::new(r.clone())));
     }
 
     // DESIGN_PRINCIPLES §1, bulk transfers: a silence of more than 5 s
@@ -5249,17 +5446,109 @@ mod tests {
         assert!(lines.iter().all(|line| line.contains("Never used to fail the send")), "it decides nothing");
     }
 
-    // DESIGN_PRINCIPLES §1: the production watch asserts a violation as the
-    // send assertion does, panicking in debug (in release: `[SEND-ASSERT]`
-    // and an ERROR line, and nothing else).
+    // "Panic at the end" (James, 2026-10-10). A Fraction and an Ended reach
+    // the watch with the Resource's lock held: Resource::request calls the
+    // progress callback inside `&mut self`, which link.rs runs under
+    // `resource_arc.lock()` on a thread of its own, and a closing link
+    // cancels it under its lock. A silence found there is logged and
+    // recorded, and nothing panics there: that lock is not poisoned, the
+    // thread holding it goes on, and the upload concludes by its own event.
+    // Only the owner's end point, after it recorded the failure, asserts it
+    // (debug: on a thread of its own; release: nothing more).
+    #[test]
+    fn a_silence_found_under_the_resources_lock_never_panics_there() {
+        use reticulum_rust::resource::ResourceStatus;
+        let (resource, advertised, now, heard, end) =
+            watched_upload("locked upload", Arc::new(ResourceSilenceWatch::log_violation));
+        advertised(); // the advertise thread, no lock held
+
+        advance(&now, 6.0);
+        let served = {
+            let resource = resource.clone();
+            std::thread::spawn(move || serve_request(&mut resource.lock().unwrap(), 2))
+        };
+        assert!(served.join().is_ok(), "a request served 6 s later: no panic under the Resource's lock");
+        assert!(!resource.is_poisoned(), "its lock is not poisoned");
+        assert_eq!(resource.lock().unwrap().sent_parts, 2, "the Resource went on");
+        assert!(end.lock().unwrap().is_none(), "nothing asserted before the end point");
+
+        advance(&now, 7.0);
+        let closed = {
+            let resource = resource.clone();
+            std::thread::spawn(move || resource.lock().unwrap().cancel())
+        };
+        assert!(closed.join().is_ok(), "its link closing 7 s later: no panic under the Resource's lock");
+        assert!(!resource.is_poisoned());
+        assert_eq!(resource.lock().unwrap().status, ResourceStatus::Failed, "concluded by its own event");
+        let heard = heard.lock().unwrap().clone();
+        assert_eq!(heard.len(), 4, "{:?}", heard);
+        assert_eq!(heard[0], "Advertised");
+        assert!(heard[1].starts_with("Fraction("), "{:?}", heard);
+        assert_eq!(heard[2..], ["Ended".to_string(), "failed".to_string()], "the owner recorded its failure");
+
+        let end = end.lock().unwrap().take();
+        #[cfg(debug_assertions)]
+        {
+            let panic = end
+                .expect("debug: the end point asserts what was recorded")
+                .join()
+                .expect_err("on its own thread, which panics");
+            let report = panic.downcast_ref::<String>().cloned().unwrap_or_default();
+            assert!(report.contains("locked upload Resource transfer silent for 6.00s, moving again"), "{}", report);
+            assert!(report.contains("locked upload Resource transfer silent for 7.00s, ended"), "{}", report);
+        }
+        #[cfg(not(debug_assertions))]
+        assert!(end.is_none(), "release: logged where found, and nothing more");
+    }
+
+    // In a debug build the recorded silence panics at the owner's end point,
+    // once the owner has recorded the delivery, and not where it was found
+    // (the proof, under the Resource's lock).
     #[test]
     #[cfg(debug_assertions)]
-    #[should_panic(expected = "DESIGN_PRINCIPLES §1 VIOLATION: asserted upload Resource transfer silent for 6.00s, ended")]
-    fn the_silence_watch_asserts_a_violation_in_debug() {
-        let watch = ResourceSilenceWatch::new("asserted upload");
-        let t0 = Instant::now();
-        assert_eq!(watch.note(SendProgress::Advertised, t0), None);
-        watch.note(SendProgress::Ended, t0 + Duration::from_secs(6));
+    #[should_panic(expected = "DESIGN_PRINCIPLES §1 VIOLATION: asserted upload Resource transfer silent for 6.00s, delivered")]
+    fn in_debug_a_recorded_silence_panics_at_the_owners_end_point() {
+        let (resource, advertised, now, heard, end) =
+            watched_upload("asserted upload", Arc::new(ResourceSilenceWatch::log_violation));
+        advertised();
+        advance(&now, 6.0);
+        let proved = {
+            let resource = resource.clone();
+            std::thread::spawn(move || prove(&resource))
+        };
+        assert!(proved.join().is_ok(), "no panic where it was found, under the Resource's lock");
+        assert!(!resource.is_poisoned());
+        assert_eq!(*heard.lock().unwrap(), vec!["Advertised".to_string(), "delivered".to_string()]);
+        let thread = end.lock().unwrap().take().expect("the end point started the debug panic");
+        if let Err(panic) = thread.join() {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    // In a release build the watch only logs, as before: the silence is
+    // logged where it is found (`[SEND-ASSERT]` and an ERROR line), and the
+    // end point asserts nothing more.
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn in_release_the_silence_watch_only_logs() {
+        let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = lines.clone();
+        let (resource, advertised, now, heard, end) = watched_upload(
+            "released upload",
+            Arc::new(move |line: &str| {
+                ResourceSilenceWatch::log_violation(line);
+                sink.lock().unwrap().push(line.to_string());
+            }),
+        );
+        advertised();
+        advance(&now, 6.0);
+        prove(&resource);
+        assert!(!resource.is_poisoned());
+        assert_eq!(*heard.lock().unwrap(), vec!["Advertised".to_string(), "delivered".to_string()]);
+        let lines = lines.lock().unwrap().clone();
+        assert_eq!(lines.len(), 1, "{:?}", lines);
+        assert!(lines[0].starts_with("DESIGN_PRINCIPLES §1 VIOLATION: released upload Resource transfer silent for 6.00s, delivered"));
+        assert!(end.lock().unwrap().take().is_none(), "the end point does nothing more in release");
     }
 
     // The watch starts at the Resource's first event (on a fast link a
