@@ -318,20 +318,25 @@ pub type SendProgressCallback = Arc<dyn Fn(SendProgress) + Send + Sync + 'static
 
 /// DESIGN_PRINCIPLES §1, bulk transfers (James, 2026-09-30): from its
 /// advertisement on, a Resource must show progress at least every 5 s; a
-/// longer silence is a §1 violation and is logged as one, and it is never
-/// used to decide the send. This is that watch for a caller of
-/// [`AppLinks::send_on_held_link`] with no watch of its own (the phones'
-/// distro outbox uploads; LXMRouter has its own). It is fed only by the
-/// progress the Resource already reports ([`SendProgress`]), through
-/// [`Self::on_progress`], and by the delivery, through [`Self::delivered`].
+/// longer silence is a §1 violation and is asserted and logged as one, and
+/// it is never used to decide the send. This is that watch for a caller of
+/// [`AppLinks::send_on_held_link_owed`] or [`AppLinks::send_on_held_link`]
+/// with no watch of its own (the phones' distro outbox uploads; LXMRouter
+/// has its own). It is fed only by the progress the Resource already reports
+/// ([`SendProgress`]), through [`Self::on_progress`], and by the delivery,
+/// through [`Self::delivered`].
 ///
 /// It starts at the Resource's first event (its `Advertised`, or on a fast
 /// link a `Fraction` that came first), measures the silence before each
 /// later event, and stops at `Ended` or the delivery. A silence over the
-/// limit is logged when it ends, at the next event: no timer runs
+/// limit is asserted when it ends, at the next event: no timer runs
 /// (DESIGN_PRINCIPLES §4), and every Resource ends with one of those
-/// events. It logs and decides nothing: it holds no callback of the send,
-/// and nothing reads it back.
+/// events. Asserted as LXMRouter's twin and `send_assertion` assert (§1:
+/// panic in debug, `[SEND-ASSERT]` and an ERROR line in release). The debug
+/// panic is on the thread that reported the event, a Resource or link
+/// thread, as `send_assertion`'s `link.establish` panics on the link's own
+/// thread. It decides nothing: it holds no callback of the send, nothing
+/// reads it back, and in release it changes no state.
 pub struct ResourceSilenceWatch {
     label: String,
     /// When the watched Resource last showed progress; `None` when nothing
@@ -341,15 +346,28 @@ pub struct ResourceSilenceWatch {
 }
 
 impl ResourceSilenceWatch {
-    /// A watch whose lines name the upload `label`, logged at ERROR.
+    /// A watch whose violations name the upload `label`, asserted (§1).
     pub fn new(label: impl Into<String>) -> Arc<Self> {
-        Self::with_sink(
-            label,
-            Arc::new(|line: &str| log(line, reticulum_rust::LOG_ERROR, false, false)),
-        )
+        Self::with_sink(label, Arc::new(Self::assert_violation))
     }
 
-    /// A watch whose lines go to `sink` (tests).
+    /// §1: panic in debug; `[SEND-ASSERT]` and an ERROR line in release,
+    /// with no state change (bulk transfers: never used to fail the send).
+    fn assert_violation(line: &str) {
+        // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+        #[cfg(debug_assertions)]
+        {
+            log(line, reticulum_rust::LOG_ERROR, false, false);
+            panic!("{}", line);
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            eprintln!("[SEND-ASSERT] {}", line);
+            log(line, reticulum_rust::LOG_ERROR, false, false);
+        }
+    }
+
+    /// A watch whose violations go to `sink` (tests).
     fn with_sink(label: impl Into<String>, sink: Arc<dyn Fn(&str) + Send + Sync + 'static>) -> Arc<Self> {
         Arc::new(Self { label: label.into(), last: Mutex::new(None), sink })
     }
@@ -369,7 +387,7 @@ impl ResourceSilenceWatch {
     }
 
     /// One event of the watched Resource at `at`. Returns the silence it
-    /// ended when that was over the §1 limit (it has been logged).
+    /// ended when that was over the §1 limit (it has been asserted).
     fn note(&self, event: SendProgress, at: Instant) -> Option<Duration> {
         match event {
             SendProgress::Advertised | SendProgress::Fraction(_) => {
@@ -396,7 +414,7 @@ impl ResourceSilenceWatch {
         (self.sink)(&format!(
             "DESIGN_PRINCIPLES §1 VIOLATION: {} Resource transfer silent for {:.2}s, {} \
              (limit {:.1}s between progress events; total time is not measured). \
-             Logged only: the Resource's own events decide the upload. FIX THE CODE.",
+             Never used to fail the send: the Resource's own events decide the upload. FIX THE CODE.",
             self.label,
             silence.as_secs_f64(),
             how,
@@ -5228,7 +5246,20 @@ mod tests {
         assert_eq!(lines.len(), 2, "{:?}", lines);
         assert!(lines[0].starts_with("DESIGN_PRINCIPLES §1 VIOLATION: distro upload Resource transfer silent for 6.50s, moving again"), "{}", lines[0]);
         assert!(lines[1].contains("silent for 13.00s, ended"), "{}", lines[1]);
-        assert!(lines.iter().all(|line| line.contains("Logged only")), "it decides nothing");
+        assert!(lines.iter().all(|line| line.contains("Never used to fail the send")), "it decides nothing");
+    }
+
+    // DESIGN_PRINCIPLES §1: the production watch asserts a violation as the
+    // send assertion does, panicking in debug (in release: `[SEND-ASSERT]`
+    // and an ERROR line, and nothing else).
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "DESIGN_PRINCIPLES §1 VIOLATION: asserted upload Resource transfer silent for 6.00s, ended")]
+    fn the_silence_watch_asserts_a_violation_in_debug() {
+        let watch = ResourceSilenceWatch::new("asserted upload");
+        let t0 = Instant::now();
+        assert_eq!(watch.note(SendProgress::Advertised, t0), None);
+        watch.note(SendProgress::Ended, t0 + Duration::from_secs(6));
     }
 
     // The watch starts at the Resource's first event (on a fast link a
