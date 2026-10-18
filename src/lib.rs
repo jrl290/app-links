@@ -1183,6 +1183,26 @@ impl AppLinks {
         Self::request_reopen_internal(dest_hash, true);
     }
 
+    /// A request on `link` failed: no answer within its timeout, or the link
+    /// closed under it. Tear the link down, as LXMRouter.message_get_failed
+    /// does for its propagation-node link (LXMF 1.1.1), so the next request
+    /// opens a fresh one. A link to a node that restarted without closing it
+    /// otherwise stays ACTIVE here until it goes stale, twice its keepalive,
+    /// which follows the RTT (RNS Link: rtt x 360/1.75, 5 s to 360 s): about
+    /// 10 s on a LAN, minutes on a slow route, and every request on it fails
+    /// until then. The close reports `APP_LINK_DISCONNECTED` as any
+    /// other close does. Call it from a request's failed callback, not from a
+    /// caller's own shorter deadline: a slow answer is not a dead link.
+    pub fn request_failed(link: &LinkHandle) {
+        log(
+            "[APP_LINK] a request failed on its link: torn down, the next request opens a fresh one",
+            LOG_NOTICE,
+            false,
+            false,
+        );
+        link.teardown();
+    }
+
     /// Close an app link.  Removes from registry, drops any held link and
     /// inbound link, fires `APP_LINK_NONE` callback.
     pub fn close(dest_hash: &[u8]) {
@@ -6529,5 +6549,22 @@ mod tests {
         );
         assert!(heard.propagation[0] < tier2, "while the chain was still on tier 1 (tier 2 at {:?}): {:?}", tier2, heard);
         assert_eq!(heard.delivered.len(), 1, "{:?}", heard);
+    }
+
+    /// A request on a held link that fails tears the link down, as
+    /// LXMRouter.message_get_failed tears down its propagation-node link: a
+    /// link to a node that restarted stays ACTIVE here until it goes stale
+    /// (minutes on a slow route), and every request on it fails until then.
+    #[test]
+    fn a_failed_request_tears_its_link_down() {
+        use reticulum_rust::destination::Destination;
+        let link = LinkHandle::spawn(Link::new_inbound(Destination::default()).expect("test link"));
+        assert_ne!(link.status(), reticulum_rust::link::STATE_CLOSED);
+        AppLinks::request_failed(&link);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while link.status() != reticulum_rust::link::STATE_CLOSED && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(link.status(), reticulum_rust::link::STATE_CLOSED);
     }
 }
