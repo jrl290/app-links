@@ -668,6 +668,58 @@ impl Registry {
 
 static REGISTRY: Lazy<Mutex<Registry>> = Lazy::new(|| Mutex::new(Registry::new()));
 
+/// A request handler on a held outbound link: the node's push (RFed-spec Link.md
+/// "Path map — node → client"). Given the path and the request data, it answers
+/// whether the client now holds the blob; that answer goes back as msgpack `bool`
+/// and is the delivery proof.
+pub type OutboundRequestHandler = Arc<dyn Fn(&str, &[u8]) -> bool + Send + Sync>;
+
+/// What a held outbound link to one destination is set up with before it is
+/// created, and on every re-open.
+#[derive(Clone, Default)]
+pub struct OutboundLinkSetup {
+    /// Sent as LINKIDENTIFY as soon as the link is established, before ACTIVE
+    /// is reported, so requests that authenticate by link identity can follow.
+    pub identify_as: Option<Identity>,
+    /// Registered on the outbound `Destination` before `Link::new_outbound`:
+    /// a link captures its destination at creation, so a handler registered
+    /// after the link exists is never seen (RFed-spec Link.md).
+    pub request_handlers: Vec<(String, OutboundRequestHandler)>,
+}
+
+static OUTBOUND_SETUP: Lazy<Mutex<HashMap<Vec<u8>, OutboundLinkSetup>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn outbound_setup(dest_hash: &[u8]) -> OutboundLinkSetup {
+    OUTBOUND_SETUP
+        .lock()
+        .ok()
+        .and_then(|m| m.get(dest_hash).cloned())
+        .unwrap_or_default()
+}
+
+/// The msgpack `bool` a push handler's answer is sent as.
+fn msgpack_bool(value: bool) -> Vec<u8> {
+    vec![if value { 0xc3 } else { 0xc2 }]
+}
+
+fn register_outbound_handlers(destination: &mut Destination, setup: &OutboundLinkSetup) {
+    for (path, handler) in &setup.request_handlers {
+        let handler = handler.clone();
+        let callback: reticulum_rust::destination::RequestHandlerCallback =
+            Arc::new(move |path: &str, data: &[u8], _request_id: &[u8], _remote, _link, _at| {
+                msgpack_bool(handler(path, data))
+            });
+        let _ = destination.register_request_handler(
+            path.clone(),
+            Some(callback),
+            reticulum_rust::destination::ALLOW_ALL,
+            None,
+            false,
+        );
+    }
+}
+
 /// Public façade.
 pub struct AppLinks;
 
@@ -1042,6 +1094,16 @@ impl AppLinks {
     /// registry until the link closes or [`Self::close`] is called.
     pub fn open_persistent(dest_hash: &[u8], app_name: &str, aspects: &[&str]) {
         Self::open_with_mode(dest_hash, app_name, aspects, LinkMode::Persistent);
+    }
+
+    /// Set up every held outbound link to `dest_hash` from now on: identify as
+    /// `setup.identify_as` once established, and answer the node's requests on
+    /// `setup.request_handlers`. Call before [`Self::open_persistent`]; a link
+    /// already open keeps the setup it was created with until it re-opens.
+    pub fn set_outbound_link_setup(dest_hash: &[u8], setup: OutboundLinkSetup) {
+        if let Ok(mut m) = OUTBOUND_SETUP.lock() {
+            m.insert(dest_hash.to_vec(), setup);
+        }
     }
 
     /// Open an app link in `mode`.
@@ -1827,13 +1889,17 @@ impl AppLinks {
                     }
                 };
 
+                let setup = outbound_setup(&dest_owned);
                 let destination = match Destination::new_outbound(
                     Some(identity),
                     DestinationType::Single,
                     app_name,
                     aspects,
                 ) {
-                    Ok(destination) => destination,
+                    Ok(mut destination) => {
+                        register_outbound_handlers(&mut destination, &setup);
+                        destination
+                    }
                     Err(e) => {
                         spec_for_open
                             .attempt_in_flight
@@ -1885,6 +1951,7 @@ impl AppLinks {
                     let dest_cb = dest_owned.clone();
                     let iface_cb = iface.clone();
                     let spec_cb = spec_for_open.clone();
+                    let identify_as = setup.identify_as.clone();
                     handle.set_link_established_callback(Some(Arc::new(move |established_handle: LinkHandle| {
                         let still_tracked = REGISTRY
                             .lock()
@@ -1915,6 +1982,22 @@ impl AppLinks {
                         // A link is never STALE before it has been ACTIVE, so
                         // its recovery is heard from here on, beside its close.
                         AppLinks::watch_recovery(&dest_cb, &established_handle);
+
+                        // LINKIDENTIFY before ACTIVE, so no request this client
+                        // sends on the link can be the first thing the node sees.
+                        if let Some(ref identity) = identify_as {
+                            if established_handle.identify(identity).is_err() {
+                                log(
+                                    &format!(
+                                        "[APP_LINK] persistent open: identify failed, link gone, for {}",
+                                        hexrep(&dest_cb, false)
+                                    ),
+                                    LOG_NOTICE,
+                                    false,
+                                    false,
+                                );
+                            }
+                        }
 
                         spec_cb.ever_established.store(true, Ordering::Relaxed);
                         spec_cb.reconnect_armed.store(true, Ordering::Release);
@@ -3764,6 +3847,52 @@ mod tests {
     use std::sync::mpsc;
 
     static REGISTRY_TEST_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+    // RFed-spec Link.md: the node's /delivery push is a request on the client's
+    // own outbound link, answered with a msgpack bool, so its handler must sit on
+    // the outbound Destination before the link exists.
+    #[test]
+    fn outbound_setup_puts_push_handlers_on_the_outbound_destination() {
+        let node = Identity::new(true);
+        let mut destination =
+            Destination::new_outbound(Some(node), DestinationType::Single, "rfed".into(), vec!["link".into()])
+                .unwrap();
+        let seen: Arc<Mutex<Vec<(String, Vec<u8>)>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_cb = seen.clone();
+        let holds: OutboundRequestHandler = Arc::new(move |path: &str, data: &[u8]| {
+            seen_cb.lock().unwrap().push((path.to_string(), data.to_vec()));
+            data != b"drop"
+        });
+        let setup = OutboundLinkSetup {
+            identify_as: None,
+            request_handlers: vec![("/delivery".into(), holds.clone()), ("/lxmf/delivery".into(), holds)],
+        };
+        register_outbound_handlers(&mut destination, &setup);
+
+        let handler = destination
+            .request_handlers
+            .get(&reticulum_rust::identity::truncated_hash(b"/delivery"))
+            .expect("/delivery registered on the outbound destination");
+        let callback = handler.callback.clone().unwrap();
+        assert_eq!(callback("/delivery", b"blob", b"id", None, None, 0.0), vec![0xc3], "held: msgpack true");
+        assert_eq!(callback("/delivery", b"drop", b"id", None, None, 0.0), vec![0xc2], "dropped: msgpack false");
+        assert!(destination
+            .request_handlers
+            .contains_key(&reticulum_rust::identity::truncated_hash(b"/lxmf/delivery")));
+        assert_eq!(seen.lock().unwrap()[0], ("/delivery".to_string(), b"blob".to_vec()));
+    }
+
+    #[test]
+    fn outbound_setup_is_kept_per_destination() {
+        let dest = [0x5au8; 16];
+        assert!(outbound_setup(&dest).identify_as.is_none());
+        AppLinks::set_outbound_link_setup(
+            &dest,
+            OutboundLinkSetup { identify_as: Some(Identity::new(true)), request_handlers: Vec::new() },
+        );
+        assert!(outbound_setup(&dest).identify_as.is_some());
+        assert!(outbound_setup(&[0x5bu8; 16]).identify_as.is_none());
+    }
 
     fn reset_registry_for_test() {
         if let Ok(mut reg) = REGISTRY.lock() {
