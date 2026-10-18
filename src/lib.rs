@@ -778,8 +778,26 @@ impl AppLinks {
         false
     }
 
+    /// An outbound link closed. Only the link the registry holds for
+    /// `dest_hash` reports `APP_LINK_DISCONNECTED` and spends the re-open arm.
+    /// A link a newer one replaced (tier-3 inserts over the held link) decides
+    /// nothing: the link now held may be ACTIVE. Until 2026-10-17 its close
+    /// reported DISCONNECTED for that ACTIVE link, and spent the re-open (C3):
+    /// LXMRouter then dropped its reference to the live link and, for the
+    /// propagation node, failed a sync in progress.
     fn handle_tracked_outbound_closed(dest_hash: Vec<u8>, closing: LinkHandle) {
-        let _ = Self::remove_tracked_outbound_if_same(&dest_hash, &closing);
+        if !Self::remove_tracked_outbound_if_same(&dest_hash, &closing) {
+            log(
+                &format!(
+                    "[APP_LINK] a closed outbound link is not the one held for {}: not reported",
+                    hexrep(&dest_hash, false)
+                ),
+                LOG_NOTICE,
+                false,
+                false,
+            );
+            return;
+        }
         Self::invalidate_liveness(&dest_hash);
         log(
             &format!(
@@ -4522,6 +4540,47 @@ mod tests {
 
         old.teardown();
         new.teardown();
+        REGISTRY.lock().unwrap().status_callbacks.clear();
+        reset_registry_for_test();
+    }
+
+    /// A link a newer one replaced in the registry closes: nothing is
+    /// reported, the re-open arm and the liveness entry are kept, as the link
+    /// now held decides. Until 2026-10-17 such a close reported DISCONNECTED
+    /// while the held link was ACTIVE, and spent its one re-open (C3). The
+    /// held link's own close is reported as ever.
+    #[test]
+    fn a_replaced_link_that_closes_reports_nothing_and_keeps_the_reopen_arm() {
+        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        reset_registry_for_test();
+        let dest: Vec<u8> = (0u8..16).map(|i| i.wrapping_mul(229)).collect();
+        let held = stale_link((0u8..16).map(|i| i.wrapping_mul(233)).collect());
+        let replaced = stale_link((0u8..16).map(|i| i.wrapping_mul(239)).collect());
+        held_for_test(&dest, &held);
+        AppLinks::arm_reconnect_if_persistent(&dest);
+        LIVENESS_CACHE.lock().unwrap().insert(dest.clone(), ("test".to_string(), Instant::now()));
+        let seen = record_events_for(&dest);
+
+        AppLinks::handle_tracked_outbound_closed(dest.clone(), replaced.clone());
+        assert!(seen.lock().unwrap().is_empty(), "a replaced link's close reports nothing");
+        assert!(
+            REGISTRY.lock().unwrap().links.get(&dest).map(|l| l.same_link(&held)).unwrap_or(false),
+            "the held link stays held"
+        );
+        assert!(LIVENESS_CACHE.lock().unwrap().contains_key(&dest), "its path stays live");
+        assert!(AppLinks::consume_reconnect_arm(&dest), "and its re-open arm is kept");
+
+        AppLinks::handle_tracked_outbound_closed(dest.clone(), held.clone());
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 1, "the held link's close is reported once, synchronously");
+            assert_eq!(seen[0].0, APP_LINK_DISCONNECTED);
+        }
+        assert!(REGISTRY.lock().unwrap().links.get(&dest).is_none(), "and it is held no longer");
+        assert!(!LIVENESS_CACHE.lock().unwrap().contains_key(&dest), "nor is its path live");
+
+        held.teardown();
+        replaced.teardown();
         REGISTRY.lock().unwrap().status_callbacks.clear();
         reset_registry_for_test();
     }
