@@ -168,4 +168,6 @@ cargo build
 
 ## License
 
-app-links is James LaFarge's work. Parts of it follow the behaviour of LXMF's router, so it is distributed under the Reticulum License, with Mark Qvist's notice for those parts. See [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE).
+
+app-links is James LaFarge's design: tiered sends, path races and the link registry are its own. At a few points it matches the behaviour of Mark Qvist's LXMF and Reticulum, such as when a failed request tears its link down or how long an unanswered Resource is given, and its comments cite the Python functions it matches, but it contains none of his code. It is built on [Reticulum-rust](https://github.com/jrl290/Reticulum-rust) and [LXMF-rust](https://github.com/jrl290/LXMF-rust), ports of Mark Qvist's Reticulum and LXMF that are under the Reticulum License.
