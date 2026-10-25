@@ -165,3 +165,7 @@ Then build normally:
 ```bash
 cargo build
 ```
+
+## License
+
+app-links is James LaFarge's work. Parts of it follow the behaviour of LXMF's router, so it is distributed under the Reticulum License, with Mark Qvist's notice for those parts. See [LICENSE](LICENSE).
