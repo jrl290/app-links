@@ -201,6 +201,34 @@ pub const APP_LINK_DISCONNECTED: u8 = 0x04;
 /// ignored it behaves as it did.
 pub const APP_LINK_RECOVERED: u8 = 0x05;
 
+// ─── Route speed ─────────────────────────────────────────────────────────
+
+/// A route is slow when the round trip a link to the destination measured
+/// on coming up was longer than this.  That round trip is the link's own
+/// ping: RNS times the link request against its proof (RNS/Link.py `rtt`),
+/// so knowing it costs nothing more on the air.
+///
+/// James, 2026-11-04: "The point of the ping is to understand whether we're
+/// on a fast connection or slow."  The 5-second rule doesn't apply over LoRa
+/// (James, 2026-11-03), and a phone can't tell LoRa from its own interfaces:
+/// Bluetooth to an RTNode says 700 kbps.  Fast routes measure milliseconds
+/// (the staging backbone's links 0.004-0.006 s); the Pixel over Bluetooth to
+/// an RTNode and then LoRa measured 4.5-13 s.  Calling a fast route slow
+/// only drops the 5-second rule for it, while calling a slow route fast
+/// breaks its link, so the line sits low.  DESIGN_PRINCIPLES.md §1, "LoRa
+/// connections".
+pub const SLOW_ROUTE_RTT_SECS: f64 = 1.0;
+
+/// [`AppLinks::route_speed`]: no link to the destination has come up yet.
+pub const ROUTE_UNKNOWN: u8 = 0;
+/// [`AppLinks::route_speed`]: the last link measured at most [`SLOW_ROUTE_RTT_SECS`].
+pub const ROUTE_FAST: u8 = 1;
+/// [`AppLinks::route_speed`]: the last link measured more than [`SLOW_ROUTE_RTT_SECS`].
+pub const ROUTE_SLOW: u8 = 2;
+
+/// The round trip the latest link to each destination measured on coming up.
+static ROUTE_RTT: Lazy<Mutex<HashMap<Vec<u8>, f64>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
 /// Tier-advance stagger for a message that fits ONE link packet: after a
 /// tier fires its packet, the next tier fires this many seconds later unless
 /// the send has been delivered by then.  The earlier packet stays in flight.
@@ -724,6 +752,36 @@ fn register_outbound_handlers(destination: &mut Destination, setup: &OutboundLin
 pub struct AppLinks;
 
 impl AppLinks {
+    /// Whether the route to `dest_hash` is fast or slow, by the round trip
+    /// the latest link to it measured on coming up ([`SLOW_ROUTE_RTT_SECS`]):
+    /// [`ROUTE_UNKNOWN`], [`ROUTE_FAST`] or [`ROUTE_SLOW`].  Every new link
+    /// measures again, so a phone that moves from LoRa to Wi-Fi is fast from
+    /// its next link on.
+    pub fn route_speed(dest_hash: &[u8]) -> u8 {
+        match ROUTE_RTT.lock().ok().and_then(|m| m.get(dest_hash).copied()) {
+            None => ROUTE_UNKNOWN,
+            Some(rtt) if rtt > SLOW_ROUTE_RTT_SECS => ROUTE_SLOW,
+            Some(_) => ROUTE_FAST,
+        }
+    }
+
+    fn note_route_rtt(dest_hash: &[u8], rtt: f64) {
+        if let Ok(mut m) = ROUTE_RTT.lock() {
+            m.insert(dest_hash.to_vec(), rtt);
+        }
+        log(
+            &format!(
+                "[APP_LINK] route to {} measured {:.3} s as its link came up: {}",
+                hexrep(dest_hash, false),
+                rtt,
+                if rtt > SLOW_ROUTE_RTT_SECS { "slow" } else { "fast" }
+            ),
+            LOG_NOTICE,
+            false,
+            false,
+        );
+    }
+
     fn emit_status(dest_hash: &[u8], status: u8, link: Option<LinkHandle>) {
         let cbs: Vec<AppLinkStatusCallback> = REGISTRY
             .lock()
@@ -1989,6 +2047,12 @@ impl AppLinks {
                         if let Ok(mut reg) = REGISTRY.lock() {
                             reg.links.insert(dest_cb.clone(), established_handle.clone());
                             reg.ready.insert(dest_cb.clone(), Instant::now());
+                        }
+                        // The link's own ping says whether the route is fast
+                        // or slow (route_speed).  This callback runs on its
+                        // own thread, so the snapshot can't wait on itself.
+                        if let Some(rtt) = established_handle.snapshot().ok().and_then(|s| s.rtt) {
+                            AppLinks::note_route_rtt(&dest_cb, rtt);
                         }
 
                         {
@@ -6566,5 +6630,24 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(link.status(), reticulum_rust::link::STATE_CLOSED);
+    }
+}
+
+#[cfg(test)]
+mod route_speed_tests {
+    use super::*;
+
+    #[test]
+    fn route_speed_follows_the_latest_link_round_trip() {
+        let dest = vec![0xA5; 16];
+        assert_eq!(AppLinks::route_speed(&dest), ROUTE_UNKNOWN);
+        // The Pixel's RFed link over Bluetooth, an RTNode and LoRa, 2026-11-04.
+        AppLinks::note_route_rtt(&dest, 4.513);
+        assert_eq!(AppLinks::route_speed(&dest), ROUTE_SLOW);
+        // A link over the staging backbone.
+        AppLinks::note_route_rtt(&dest, 0.005);
+        assert_eq!(AppLinks::route_speed(&dest), ROUTE_FAST);
+        AppLinks::note_route_rtt(&dest, SLOW_ROUTE_RTT_SECS);
+        assert_eq!(AppLinks::route_speed(&dest), ROUTE_FAST);
     }
 }
