@@ -229,6 +229,32 @@ pub const ROUTE_SLOW: u8 = 2;
 /// The round trip the latest link to each destination measured on coming up.
 static ROUTE_RTT: Lazy<Mutex<HashMap<Vec<u8>, f64>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
+/// One DIRECT send at a time to each destination over a slow route: the
+/// next waits for the one before it to be delivered or fail on its own
+/// events, then finds its link up (tier 2).  DESIGN_PRINCIPLES.md §1, "LoRa
+/// connections": requests to a node take turns, one at a time, so a burst
+/// can't flood the radio.  On 2026-11-13 two messages sent a few seconds
+/// apart over LoRa opened two links to the same iPad.
+static SLOW_ROUTE_TURNS: Lazy<Mutex<HashMap<Vec<u8>, Arc<Mutex<()>>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// The rule behind [`AppLinks::send_route_is_slow`] (DESIGN_PRINCIPLES.md §1,
+/// "LoRa connections").  A route a link has measured is what it measured.
+/// One not measured yet goes by the device's own connection: fast while the
+/// device holds a link that measured fast (on a high-speed connection, its
+/// link to RFed: James, 2026-11-04, "Retichat clients will record the round
+/// trip time to RFed in order to determine their link speed"), and otherwise
+/// slow, as an unmeasured connection counts.  So a phone on the internet
+/// keeps the 5-second rule for a peer it has not linked to yet, while one
+/// whose only way out is LoRa (an RNode, or Bluetooth to an RTNode) does not.
+fn route_is_slow(speed: u8, holds_fast_link: bool) -> bool {
+    match speed {
+        ROUTE_FAST => false,
+        ROUTE_SLOW => true,
+        _ => !holds_fast_link,
+    }
+}
+
 /// Tier-advance stagger for a message that fits ONE link packet: after a
 /// tier fires its packet, the next tier fires this many seconds later unless
 /// the send has been delivered by then.  The earlier packet stays in flight.
@@ -780,6 +806,25 @@ impl AppLinks {
             false,
             false,
         );
+    }
+
+    /// Whether a DIRECT send to `dest_hash`, or the path race when its chat
+    /// opens, goes over a slow route, where the 5-second rule does not hold
+    /// (DESIGN_PRINCIPLES.md §1, "LoRa connections").  See [`route_is_slow`].
+    pub fn send_route_is_slow(dest_hash: &[u8]) -> bool {
+        let speed = Self::route_speed(dest_hash);
+        route_is_slow(speed, speed == ROUTE_UNKNOWN && Self::holds_fast_link())
+    }
+
+    /// The device holds a link that is up and whose route measured fast:
+    /// on a high-speed connection that is its link to RFed.
+    fn holds_fast_link() -> bool {
+        let held: Vec<(Vec<u8>, LinkHandle)> = REGISTRY
+            .lock()
+            .map(|r| r.links.iter().map(|(d, h)| (d.clone(), h.clone())).collect())
+            .unwrap_or_default();
+        held.into_iter()
+            .any(|(dest, link)| Self::route_speed(&dest) == ROUTE_FAST && link.status() == STATE_ACTIVE)
     }
 
     fn emit_status(dest_hash: &[u8], status: u8, link: Option<LinkHandle>) {
@@ -1813,7 +1858,17 @@ impl AppLinks {
                 // confirmed in this process. Disk-restored routes are not
                 // sufficient because the first actual LRREQ would otherwise
                 // discover staleness only after the user hits Send.
-                let result = match if Self::ephemeral_requires_verified_session_path(&spec) {
+                //
+                // Over a slow route the race asks on every interface, LoRa
+                // included, and waits as long as Reticulum's own path request
+                // does (`liveness::race_path_slow_route`): DESIGN_PRINCIPLES.md
+                // §1, "LoRa connections". Until 2026-11-13 an iPad whose only
+                // interface was an RNode had nothing to ask on, and every
+                // chat it opened went red.
+                let verified = Self::ephemeral_requires_verified_session_path(&spec);
+                let result = match if Self::send_route_is_slow(&dest_owned) {
+                    liveness::race_path_slow_route(&dest_owned, verified)
+                } else if verified {
                     liveness::race_path_verified_this_session(&dest_owned, LIVENESS_BUDGET)
                 } else {
                     liveness::race_path(&dest_owned, LIVENESS_BUDGET)
@@ -2283,23 +2338,50 @@ impl AppLinks {
         on_failed: Arc<dyn Fn() + Send + Sync + 'static>,
         on_progress: Option<SendProgressCallback>,
     ) {
+        // Over a slow route (DESIGN_PRINCIPLES.md §1, "LoRa connections") no
+        // 5-second clock runs: the send waits its turn behind the one before
+        // it to the same destination, and its tiers, its new link and the
+        // propagation fallback are each decided by their own events.
+        let slow_route = Self::send_route_is_slow(dest);
+        let turn = if slow_route {
+            SLOW_ROUTE_TURNS.lock().ok().map(|mut turns| {
+                turns
+                    .entry(dest.to_vec())
+                    .or_insert_with(|| Arc::new(Mutex::new(())))
+                    .clone()
+            })
+        } else {
+            None
+        };
+        let _turn = turn.as_ref().map(|t| t.lock().unwrap_or_else(|p| p.into_inner()));
+        if slow_route {
+            log(
+                &format!(
+                    "[APP_LINK] send to {} over a slow route: no 5 s limit, its link's own events decide",
+                    hexrep(dest, false)
+                ),
+                LOG_NOTICE, false, false,
+            );
+        }
         let prop_delay = Self::prop_fallback_delay_for_status(Self::status(dest));
         let pacing = ChainPacing {
             stagger: Duration::from_secs_f64(DIRECT_STAGGER_WAIT),
             prop_delay,
             backstop: OUTCOME_BACKSTOP,
+            slow_route,
         };
         // Timer P firing turns the destination red, unless it was already
-        // DISCONNECTED (the zero delay).
+        // DISCONNECTED (the zero delay). Over a slow route the propagation
+        // request comes when the send has failed, and that turns it red.
         let dest_p = dest.to_vec();
         let on_prop: Arc<dyn Fn() + Send + Sync + 'static> = Arc::new(move || {
-            if prop_delay > Duration::ZERO {
+            if slow_route || prop_delay > Duration::ZERO {
                 AppLinks::mark_prop_fallback_disconnected(&dest_p);
             }
             on_propagation_needed();
         });
         let outcome = SendOutcome::new(dest, on_delivered, on_failed);
-        let links = StackTiers { dest, packed: &packed, compress };
+        let links = StackTiers { dest, packed: &packed, compress, slow_route };
         Self::drive_tier_chain(
             &links,
             link_representation(packed.len()),
@@ -2350,7 +2432,17 @@ impl AppLinks {
         // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
         // This is the authoritative source of the propagation trigger delay.
         // The caller (lxm_router) handles the actual propagation mechanics.
-        {
+        //
+        // Over a slow route Timer P does not run: §1 "LoRa connections" holds
+        // no 5-second limit there, and a LoRa link takes longer than that to
+        // come up (7.2 s and 11.6 s on 2026-11-13, each cut at 5 s while it
+        // was still coming up). The send asks for propagation when it has
+        // failed on its own events, just before it reports the failure: the
+        // reference's DIRECT delivery falls back the same way, once it has
+        // failed (LXMF/LXMRouter.py, `try_propagation_on_fail`).
+        if pacing.slow_route {
+            outcome.propagate_before_failing(on_propagation_needed);
+        } else {
             let delivered_p = delivered.clone();
             let activity_p = watch.activity.clone();
             let on_prop = on_propagation_needed;
@@ -2364,8 +2456,12 @@ impl AppLinks {
 
         // How a tier hands over to the next (see "Send tiers" at the top of
         // this file): a Resource tier only on its own failure event, a packet
-        // tier after the stagger.
-        let resource = representation == LinkRepresentation::Resource;
+        // tier after the stagger. Over a slow route a packet tier also hands
+        // over only on its own failure (its receipt, which Reticulum times
+        // to the link's round trip): its message is still on its way when
+        // the stagger ends, and the next tier would open a second link over
+        // the radio for a message already in flight.
+        let resource = representation == LinkRepresentation::Resource || pacing.slow_route;
         // Packet tiers still in flight when the chain moved on. Their own
         // receipt events (proof or timeout) still decide the send; the chain
         // hears them at the end, under the same backstop.
@@ -2497,19 +2593,29 @@ impl AppLinks {
     /// the send only when no earlier tier is still in flight (`SendOutcome`).
     /// Until 2026-09-29 each of them called `on_failed` directly, and failed
     /// the message while tier 1's Resource was still moving.
+    ///
+    /// Over a slow route (`slow_route`, DESIGN_PRINCIPLES.md §1, "LoRa
+    /// connections") the path race asks on every interface, LoRa included,
+    /// and waits as long as Reticulum's own path request does
+    /// (`liveness::race_path_slow_route`), and the new link is waited for
+    /// until it comes up or Reticulum closes it, with no 5-second cut.
     fn run_tier3(
         dest: &[u8],
         packed: &[u8],
         compress: bool,
         report: TierReport,
         watch: &TransferWatch,
+        slow_route: bool,
     ) -> bool {
         log(
             &format!("[APP_LINK] send tier-3 (path race + new link) for {}", hexrep(dest, false)),
             LOG_NOTICE, false, false,
         );
 
-        let iface = match if Transport::has_path(dest) && Transport::is_path_verified_this_session(dest) {
+        let verified = Transport::has_path(dest) && Transport::is_path_verified_this_session(dest);
+        let iface = match if slow_route {
+            liveness::race_path_slow_route(dest, !verified)
+        } else if verified {
             liveness::race_path(dest, LIVENESS_BUDGET)
         } else {
             liveness::race_path_verified_this_session(dest, LIVENESS_BUDGET)
@@ -2603,7 +2709,16 @@ impl AppLinks {
         let (est_tx, est_rx) = std::sync::mpsc::sync_channel::<Result<LinkHandle, ()>>(1);
         {
             let tx = est_tx.clone();
+            let dest_rtt = dest.to_vec();
             handle.set_link_established_callback(Some(Arc::new(move |h: LinkHandle| {
+                // The link's own ping says whether the route to the peer is
+                // fast or slow (`route_speed`), even for a link that came up
+                // after a fast route's 5 s cut: the next send to the peer
+                // then goes as a slow route's does. This callback runs on its
+                // own thread, so the snapshot can't wait on itself.
+                if let Some(rtt) = h.snapshot().ok().and_then(|s| s.rtt) {
+                    AppLinks::note_route_rtt(&dest_rtt, rtt);
+                }
                 let _ = tx.send(Ok(h));
             })));
         }
@@ -2632,7 +2747,19 @@ impl AppLinks {
             return false;
         }
 
-        let established_handle = match est_rx.recv_timeout(LIVENESS_BUDGET) {
+        // Over a slow route the link's own events decide, with no clock of
+        // ours: it comes up, or Reticulum's watchdog closes it once its
+        // establishment timeout passes (scaled by hops: "Link establishment
+        // timeout" in the log). A link dropped with neither disconnects the
+        // channel. DESIGN_PRINCIPLES.md §1, "LoRa connections". Until
+        // 2026-11-13 this waited 5 s on every route, and links over LoRa that
+        // came up in 7.2 s and 11.6 s were given up while still coming up.
+        let waited = if slow_route {
+            est_rx.recv().map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected)
+        } else {
+            est_rx.recv_timeout(LIVENESS_BUDGET)
+        };
+        let established_handle = match waited {
             Ok(Ok(h)) => h,
             Ok(Err(())) => {
                 log(
@@ -2646,7 +2773,19 @@ impl AppLinks {
                 );
                 return false;
             }
-            Err(_) => {
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                log(
+                    &format!(
+                        "[APP_LINK] send tier-3: link to {} dropped without coming up or closing",
+                        hexrep(dest, false)
+                    ),
+                    LOG_NOTICE,
+                    false,
+                    false,
+                );
+                return false;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 log(
                     &format!(
                         "[APP_LINK] send tier-3: link establishment timed out for {}",
@@ -3368,6 +3507,10 @@ struct ChainPacing {
     /// ([`OUTCOME_BACKSTOP`]; quiet time only). It fails a packet tier; on a
     /// Resource tier it only logs.
     backstop: Duration,
+    /// The send goes over a slow route ([`AppLinks::send_route_is_slow`]):
+    /// no stagger and no Timer P. Each tier hands over on its own failure,
+    /// and propagation is asked for when the send has failed.
+    slow_route: bool,
 }
 
 /// One tier's line back to its send: the tier's link calls `delivered` or
@@ -3401,6 +3544,9 @@ struct StackTiers<'a> {
     dest: &'a [u8],
     packed: &'a [u8],
     compress: bool,
+    /// [`ChainPacing::slow_route`]: tier 3 races over every interface and
+    /// waits on its link's own events.
+    slow_route: bool,
 }
 
 impl TierLinks for StackTiers<'_> {
@@ -3408,7 +3554,7 @@ impl TierLinks for StackTiers<'_> {
         let dest = self.dest;
         let (handle, which) = match tier {
             Tier::NewLink => {
-                return AppLinks::run_tier3(dest, self.packed, self.compress, report, watch);
+                return AppLinks::run_tier3(dest, self.packed, self.compress, report, watch, self.slow_route);
             }
             Tier::Inbound => (AppLinks::get_inbound_handle(dest), "inbound link"),
             Tier::Cached => (
@@ -3476,6 +3622,9 @@ struct SendOutcome {
     state: Mutex<OutcomeState>,
     on_delivered: Arc<dyn Fn() + Send + Sync + 'static>,
     on_failed: Arc<dyn Fn() + Send + Sync + 'static>,
+    /// Over a slow route, the propagation request, made when the send fails
+    /// just before `on_failed` ([`Self::propagate_before_failing`]).
+    propagate_on_failure: Mutex<Option<Arc<dyn Fn() + Send + Sync + 'static>>>,
 }
 
 #[derive(Default)]
@@ -3526,7 +3675,15 @@ impl SendOutcome {
             state: Mutex::new(OutcomeState::default()),
             on_delivered,
             on_failed,
+            propagate_on_failure: Mutex::new(None),
         })
+    }
+
+    /// Over a slow route: when the send fails, call `on_propagation_needed`
+    /// first, so the caller starts its propagated copy as the direct send
+    /// ends, not on a clock (`ChainPacing::slow_route`).
+    fn propagate_before_failing(&self, on_propagation_needed: Arc<dyn Fn() + Send + Sync + 'static>) {
+        *self.propagate_on_failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(on_propagation_needed);
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, OutcomeState> {
@@ -3690,6 +3847,17 @@ impl SendOutcome {
             &format!("[APP_LINK] send failed for {}: {}", hexrep(&self.dest, false), why),
             LOG_NOTICE, false, false,
         );
+        let propagate = self.propagate_on_failure.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some(propagate) = propagate {
+            log(
+                &format!(
+                    "[APP_LINK] send to {} failed over a slow route: asking for propagation",
+                    hexrep(&self.dest, false)
+                ),
+                LOG_NOTICE, false, false,
+            );
+            propagate();
+        }
         (self.on_failed)();
     }
 }
@@ -3714,6 +3882,12 @@ pub enum SendErr {
     NoUsableInterface,
     /// Liveness race exceeded [`LIVENESS_BUDGET`] without a winner.
     LivenessTimeout,
+    /// Over a slow route ([`liveness::race_path_slow_route`]): no interface
+    /// is online at all.
+    NoOnlineInterface,
+    /// Over a slow route: no path answer within Reticulum's own path request
+    /// timeout (`transport::PATH_REQUEST_TIMEOUT`).
+    PathUnanswered,
     /// Dispatch returned an error.
     Dispatch(String),
 }
@@ -3725,6 +3899,12 @@ impl std::fmt::Display for SendErr {
                 write!(f, "no usable (online, non-LoRa) interface")
             }
             SendErr::LivenessTimeout => write!(f, "liveness race timed out (>5s)"),
+            SendErr::NoOnlineInterface => write!(f, "no online interface"),
+            SendErr::PathUnanswered => write!(
+                f,
+                "no path answer within Reticulum's path request timeout ({} s)",
+                reticulum_rust::transport::PATH_REQUEST_TIMEOUT
+            ),
             SendErr::Dispatch(e) => write!(f, "dispatch failed: {}", e),
         }
     }
@@ -3737,6 +3917,20 @@ fn liveness_candidate_interfaces() -> Vec<String> {
         .interfaces
         .iter()
     .filter(|i| i.out && i.online && i.bitrate.map_or(true, |b| b >= LORA_BITRATE_THRESHOLD))
+        .map(|i| i.name.clone())
+        .collect()
+}
+
+/// The interfaces a slow route's path race asks on: every online outbound
+/// one, LoRa-class included ([`liveness::race_path_slow_route`]). A device
+/// whose only interface is an RNode (0.81 kbps at SF10/125 kHz) is itself on
+/// LoRa and sends over LoRa every time (DESIGN_PRINCIPLES.md §1, "LoRa
+/// connections"). Until 2026-11-13 it had no candidate at all.
+fn slow_route_candidate_interfaces() -> Vec<String> {
+    reticulum_rust::transport::get_state_snapshot()
+        .interfaces
+        .iter()
+        .filter(|i| i.out && i.online)
         .map(|i| i.name.clone())
         .collect()
 }
@@ -3788,6 +3982,52 @@ impl Drop for PathRaceLogWatch {
 /// Liveness race module.
 pub mod liveness {
     use super::*;
+
+    /// The path race over a slow route (DESIGN_PRINCIPLES.md §1, "LoRa
+    /// connections"). As [`race_path`], or [`race_path_verified_this_session`]
+    /// when `verified_this_session`, it drops any cached path and needs a
+    /// fresh answer. But it asks on every online interface, LoRa-class
+    /// included (`slow_route_candidate_interfaces`), and it has no 5-second
+    /// budget: it waits as long as Reticulum's own path request does
+    /// (`transport::PATH_REQUEST_TIMEOUT`, as RNS `Transport.await_path`).
+    /// On 2026-11-13, over Bluetooth to an RTNode and then LoRa, the answer
+    /// for an iPad on an RNode came 0.5 to 4.7 s after the request, the
+    /// slower end only just inside the 5 s budget; and the iPad, whose only
+    /// interface was the RNode, had nothing to ask on.
+    pub fn race_path_slow_route(
+        dest_hash: &[u8],
+        verified_this_session: bool,
+    ) -> Result<String, SendErr> {
+        let _watch = PathRaceLogWatch::new(dest_hash);
+        let candidates = slow_route_candidate_interfaces();
+
+        if candidates.is_empty() {
+            return Err(SendErr::NoOnlineInterface);
+        }
+
+        // Drop any cached path before racing — see `race_path` for rationale.
+        Transport::expire_path(dest_hash);
+
+        for iface in &candidates {
+            Transport::request_path(dest_hash, None, Some(iface.clone()), None, None);
+        }
+
+        // Reticulum's own wait for a client's path request, not a clock of
+        // ours: the answer wakes it at once (`PATH_ADDED_NOTIFY`).
+        let wait = Duration::from_secs_f64(reticulum_rust::transport::PATH_REQUEST_TIMEOUT);
+        let answered = if verified_this_session {
+            Transport::wait_for_path_verified_this_session(dest_hash, wait)
+        } else {
+            Transport::wait_for_path(dest_hash, wait)
+        };
+        if answered {
+            if let Some(iface) = cached_path_iface_is_live(dest_hash, &candidates, verified_this_session) {
+                return Ok(iface);
+            }
+        }
+
+        Err(SendErr::PathUnanswered)
+    }
 
     /// Race a path-request on every online, non-LoRa interface and return
     /// the name of the iface whose response landed first.
@@ -6138,6 +6378,7 @@ mod tests {
             stagger: Duration::from_millis(50),
             prop_delay: Duration::from_secs(30),
             backstop: Duration::from_secs(10),
+            slow_route: false,
         }
     }
 
@@ -6565,6 +6806,97 @@ mod tests {
         assert!(heard.failed.is_empty(), "{:?}", heard);
     }
 
+    /// A slow route's clocks: the stagger and Timer P are both short, so a
+    /// chain that still used either would show it.
+    fn slow_pacing() -> ChainPacing {
+        ChainPacing {
+            stagger: Duration::from_millis(50),
+            prop_delay: Duration::from_millis(50),
+            slow_route: true,
+            ..test_pacing()
+        }
+    }
+
+    // DESIGN_PRINCIPLES §1, "LoRa connections" (1) — over a slow route a new
+    // link that delivers well after Timer P's delay gets no propagation
+    // request at all. On 2026-11-13 the phone's link to the iPad came up
+    // 7.2 s after the request, Timer P had already asked for propagation at
+    // 5 s, and tier 3 had given the link up.
+    #[test]
+    fn a_slow_route_delivers_late_with_no_propagation_request() {
+        let pacing = slow_pacing();
+        let links = FakeTiers::new(None, None, silent(Duration::from_millis(300), true));
+        let heard = drive(&links, LinkRepresentation::Packet, pacing, Duration::from_millis(100));
+        assert_eq!(heard.delivered.len(), 1, "{:?}", heard);
+        assert!(heard.delivered[0] >= pacing.prop_delay * 6, "delivered long after Timer P's delay: {:?}", heard);
+        assert!(heard.propagation.is_empty(), "no clock asks for propagation over a slow route: {:?}", heard);
+        assert!(heard.failed.is_empty(), "{:?}", heard);
+    }
+
+    // §1 "LoRa connections" (2) — when the send over a slow route fails on
+    // its own events, propagation is asked for once, then the failure is
+    // reported: when the direct send ends, not on Timer P's clock.
+    #[test]
+    fn a_slow_route_asks_for_propagation_when_the_send_fails() {
+        let pacing = slow_pacing();
+        let links = FakeTiers::new(None, None, silent(Duration::from_millis(300), false));
+        let heard = drive(&links, LinkRepresentation::Packet, pacing, Duration::from_millis(100));
+        assert!(heard.delivered.is_empty(), "{:?}", heard);
+        assert_eq!(heard.failed.len(), 1, "{:?}", heard);
+        assert_eq!(heard.propagation.len(), 1, "{:?}", heard);
+        assert!(
+            heard.propagation[0] >= Duration::from_millis(300) && heard.propagation[0] <= heard.failed[0],
+            "propagation asked for at the failure, just before it is reported: {:?}",
+            heard
+        );
+    }
+
+    // §1 "LoRa connections" (3) — no tier can fire over a slow route (no
+    // path answer): propagation is asked for, then the failure reported.
+    #[test]
+    fn a_slow_route_with_no_tier_asks_for_propagation_once() {
+        let links = FakeTiers::new(None, None, setup_fails());
+        let heard = drive(&links, LinkRepresentation::Packet, slow_pacing(), Duration::from_millis(100));
+        assert_eq!(heard.propagation.len(), 1, "{:?}", heard);
+        assert_eq!(heard.failed.len(), 1, "{:?}", heard);
+        assert!(heard.propagation[0] <= heard.failed[0], "{:?}", heard);
+    }
+
+    // §1 "LoRa connections" (4) — over a slow route a packet on the cached
+    // link (tier 2) is left to its own receipt: tier 3 does not open a second
+    // link over the radio when the stagger ends. On 2026-11-13 the phone sent
+    // "Nothing" on its cached link and, 1 s later, opened a second link to
+    // the same iPad for the same message.
+    #[test]
+    fn a_slow_route_packet_tier_hands_over_only_on_its_own_failure() {
+        let pacing = slow_pacing();
+        let links = FakeTiers::new(None, silent(Duration::from_millis(300), true), silent(Duration::ZERO, true));
+        let heard = drive(&links, LinkRepresentation::Packet, pacing, Duration::from_millis(100));
+        assert_eq!(links.asked(), vec![Tier::Inbound, Tier::Cached], "tier 3 never fired: {:?}", heard);
+        assert_eq!(heard.delivered.len(), 1, "{:?}", heard);
+        assert!(heard.propagation.is_empty(), "{:?}", heard);
+
+        // Its failure hands over: tier 3 fires at it, not at the stagger.
+        let links = FakeTiers::new(None, silent(Duration::from_millis(300), false), silent(Duration::ZERO, true));
+        let heard = drive(&links, LinkRepresentation::Packet, pacing, Duration::from_millis(100));
+        let tier3 = links.asked_at(Tier::NewLink).expect("tier 3 fires once tier 2 has failed");
+        assert!(tier3 >= Duration::from_millis(300), "tier 3 at tier 2's failure, not at the stagger: {:?}", tier3);
+        assert_eq!(heard.delivered.len(), 1, "{:?}", heard);
+        assert!(heard.failed.is_empty() && heard.propagation.is_empty(), "{:?}", heard);
+    }
+
+    // §1 "LoRa connections" (5) — a fast route is unchanged: Timer P still
+    // asks for propagation on its clock while the send is undelivered.
+    #[test]
+    fn a_fast_route_keeps_timer_p() {
+        let pacing = ChainPacing { prop_delay: Duration::from_millis(50), ..test_pacing() };
+        let links = FakeTiers::new(None, None, silent(Duration::from_millis(300), true));
+        let heard = drive(&links, LinkRepresentation::Packet, pacing, Duration::from_millis(100));
+        assert_eq!(heard.propagation.len(), 1, "{:?}", heard);
+        assert!(heard.propagation[0] < Duration::from_millis(300), "on Timer P's clock: {:?}", heard);
+        assert_eq!(heard.delivered.len(), 1, "{:?}", heard);
+    }
+
     // §O9 (7) — Timer P counts only quiet time across the whole chain: a
     // Resource that moves on tier 1, fails, and moves on tier 2 until it
     // delivers is never quiet for Timer P's delay, however long it all
@@ -6649,5 +6981,101 @@ mod route_speed_tests {
         assert_eq!(AppLinks::route_speed(&dest), ROUTE_FAST);
         AppLinks::note_route_rtt(&dest, SLOW_ROUTE_RTT_SECS);
         assert_eq!(AppLinks::route_speed(&dest), ROUTE_FAST);
+    }
+
+    /// The production source, without the tests.
+    fn production() -> &'static str {
+        include_str!("lib.rs").split("#[cfg(test)]").next().expect("production source prefix")
+    }
+
+    /// The production text from `start` up to `end`.
+    fn between(start: &str, end: &str) -> &'static str {
+        let src = production();
+        let from = src.find(start).unwrap_or_else(|| panic!("{} exists", start));
+        let len = src[from..].find(end).unwrap_or_else(|| panic!("{} follows {}", end, start));
+        &src[from..from + len]
+    }
+
+    // DESIGN_PRINCIPLES §1, "LoRa connections": a measured route is what it
+    // measured; an unmeasured one is fast only while the device holds a link
+    // that measured fast (its link to RFed, on a high-speed connection).
+    #[test]
+    fn a_route_is_slow_unless_measured_or_known_fast() {
+        assert!(!route_is_slow(ROUTE_FAST, false));
+        assert!(!route_is_slow(ROUTE_FAST, true));
+        assert!(route_is_slow(ROUTE_SLOW, false));
+        assert!(route_is_slow(ROUTE_SLOW, true), "a peer measured slow stays slow on a fast phone");
+        assert!(route_is_slow(ROUTE_UNKNOWN, false), "nothing measured fast: LoRa, as on 2026-11-13");
+        assert!(!route_is_slow(ROUTE_UNKNOWN, true), "a phone on the internet keeps the 5-second rule");
+    }
+
+    // The phone's link to the iPad over Bluetooth, an RTNode and LoRa came
+    // up in 7.182 s on 2026-11-13; a device that holds no fast link counts a
+    // peer it has not measured as slow.
+    #[test]
+    fn send_route_follows_the_peer_link_round_trip() {
+        let dest = vec![0x5E; 16];
+        assert!(AppLinks::send_route_is_slow(&dest), "unmeasured, and no fast link held in the tests");
+        AppLinks::note_route_rtt(&dest, 7.182);
+        assert!(AppLinks::send_route_is_slow(&dest));
+        AppLinks::note_route_rtt(&dest, 0.004);
+        assert!(!AppLinks::send_route_is_slow(&dest));
+    }
+
+    // A slow route's path race asks on every online interface (the iPad's
+    // RNode is 0.81 kbps), needs a fresh answer, and waits on Reticulum's own
+    // path request timeout, not LIVENESS_BUDGET.
+    #[test]
+    fn the_slow_route_race_asks_on_lora_and_waits_on_reticulum() {
+        let candidates = between("fn slow_route_candidate_interfaces(", "\n}\n");
+        assert!(candidates.contains(".filter(|i| i.out && i.online)\n"), "{}", candidates);
+        assert!(!candidates.contains("LORA_BITRATE_THRESHOLD"));
+
+        let race = between("pub fn race_path_slow_route(", "/// Race a path-request on every online, non-LoRa interface");
+        let expire = race.find("Transport::expire_path(dest_hash);").expect("drops the cached path");
+        let request = race
+            .find("Transport::request_path(dest_hash, None, Some(iface.clone()), None, None);")
+            .expect("asks for a fresh path");
+        assert!(expire < request);
+        assert!(race.contains("let candidates = slow_route_candidate_interfaces();"));
+        assert!(race.contains("Duration::from_secs_f64(reticulum_rust::transport::PATH_REQUEST_TIMEOUT)"));
+        assert!(!race.contains("LIVENESS_BUDGET"), "no 5-second budget over a slow route");
+        assert!(race.contains("cached_path_iface_is_live(dest_hash, &candidates, verified_this_session)"));
+    }
+
+    // Tier 3 over a slow route: the slow race, and its new link waited for
+    // until it comes up or Reticulum closes it. A fast route keeps both 5 s
+    // bounds. Every new link's round trip is noted, a late one included.
+    #[test]
+    fn tier_3_over_a_slow_route_waits_on_its_link() {
+        let tier3 = between("fn run_tier3(", "fn await_outcome(");
+        assert!(tier3.contains("liveness::race_path_slow_route(dest, !verified)"));
+        assert!(tier3.contains("liveness::race_path(dest, LIVENESS_BUDGET)"), "fast route unchanged");
+        assert!(tier3.contains("liveness::race_path_verified_this_session(dest, LIVENESS_BUDGET)"));
+        let wait = tier3.find("let waited = if slow_route {").expect("the wait depends on the route");
+        let slow = &tier3[wait..];
+        let slow = &slow[..slow.find("} else {").expect("fast branch")];
+        assert!(slow.contains("est_rx.recv()"), "no clock over a slow route: {}", slow);
+        assert!(tier3.contains("est_rx.recv_timeout(LIVENESS_BUDGET)"), "fast route keeps its 5 s");
+        let established = between("handle.set_link_established_callback(Some(Arc::new(move |h: LinkHandle| {", "let _ = tx.send(Ok(h));");
+        assert!(established.contains("AppLinks::note_route_rtt(&dest_rtt, rtt);"));
+    }
+
+    // The chain over a slow route takes the destination's turn, and passes
+    // the route to tier 3; a chat's open race follows the route too.
+    #[test]
+    fn slow_route_sends_take_turns_and_reach_tier_3() {
+        let chain = between("fn run_tier_chain(", "fn drive_tier_chain(");
+        let slow = chain.find("let slow_route = Self::send_route_is_slow(dest);").expect("classified first");
+        let turn = chain.find("SLOW_ROUTE_TURNS.lock()").expect("takes the turn");
+        let held = chain.find("let _turn = turn.as_ref().map(|t| t.lock()").expect("holds it");
+        let driven = chain.find("Self::drive_tier_chain(").expect("drives the chain");
+        assert!(slow < turn && turn < held && held < driven, "the turn is held while the chain runs");
+        assert!(chain.contains("let links = StackTiers { dest, packed: &packed, compress, slow_route };"));
+        assert!(production().contains(
+            "return AppLinks::run_tier3(dest, self.packed, self.compress, report, watch, self.slow_route);"
+        ));
+        let open = between("let verified = Self::ephemeral_requires_verified_session_path(&spec);", "Ok(iface) => Ok(iface),");
+        assert!(open.contains("if Self::send_route_is_slow(&dest_owned) {\n                    liveness::race_path_slow_route(&dest_owned, verified)"));
     }
 }
