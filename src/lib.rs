@@ -1568,8 +1568,18 @@ impl AppLinks {
             return APP_LINK_PATH_REQUESTED;
         }
         // EphemeralLink: ACTIVE when ready entry exists and path is still valid.
+        // Over a slow route the path may go out a LoRa interface, which the
+        // fast race's candidates leave out (`slow_route_candidate_interfaces`).
+        // On 2026-11-13 that left a chat whose path went out an iPad's RNode
+        // DISCONNECTED straight after READY, so every announce for the peer
+        // started another path race over the radio (`announce_received`):
+        // a loop of path requests and answers that filled the channel.
         if in_ready {
-            let candidates = liveness_candidate_interfaces();
+            let candidates = if Self::send_route_is_slow(dest_hash) {
+                slow_route_candidate_interfaces()
+            } else {
+                liveness_candidate_interfaces()
+            };
             if cached_path_iface_is_live(dest_hash, &candidates, false).is_some() {
                 return APP_LINK_ACTIVE;
             }
@@ -7059,6 +7069,25 @@ mod route_speed_tests {
         assert!(tier3.contains("est_rx.recv_timeout(LIVENESS_BUDGET)"), "fast route keeps its 5 s");
         let established = between("handle.set_link_established_callback(Some(Arc::new(move |h: LinkHandle| {", "let _ = tx.send(Ok(h));");
         assert!(established.contains("AppLinks::note_route_rtt(&dest_rtt, rtt);"));
+    }
+
+    // A chat that went READY over a slow route counts a path out a LoRa
+    // interface as live. Otherwise its status stays DISCONNECTED, and every
+    // announce for the peer starts another path race over the radio
+    // (`announce_received`): on 2026-11-13 the iPad asked again every few
+    // seconds, and both RTNodes answered each time with a 227-byte announce.
+    #[test]
+    fn a_ready_chat_over_a_slow_route_counts_a_lora_path() {
+        let status = between("pub fn status(dest_hash: &[u8]) -> u8 {", "pub fn get_handle(");
+        let ready = &status[status.find("if in_ready {").expect("the ready check")..];
+        assert!(
+            ready.contains("if Self::send_route_is_slow(dest_hash) {\n                slow_route_candidate_interfaces()"),
+            "{}",
+            ready
+        );
+        assert!(ready.contains("liveness_candidate_interfaces()"), "a fast route is unchanged");
+        let reopen = between("pub fn announce_received(dest_hash: &[u8]) {", "pub fn network_changed(");
+        assert!(reopen.contains("if Self::status(dest_hash) == APP_LINK_ACTIVE {\n            return;"));
     }
 
     // The chain over a slow route takes the destination's turn, and passes
