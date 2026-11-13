@@ -2781,6 +2781,13 @@ impl AppLinks {
                     false,
                     false,
                 );
+                // Over a slow route the race kept a path answered in this
+                // process (`race_path_slow_route`). A link that could not come
+                // up on it is the evidence it no longer works, so the next
+                // race asks again.
+                if slow_route {
+                    Transport::expire_path(dest);
+                }
                 return false;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -4013,6 +4020,19 @@ pub mod liveness {
 
         if candidates.is_empty() {
             return Err(SendErr::NoOnlineInterface);
+        }
+
+        // A path answered in this process is fresh, and over a slow route it
+        // is used as it is: asking again costs a round trip on the air, and
+        // dropping it takes it from under a link request already leaving on
+        // it. On 2026-11-13 a chat's race, started by the very path answer
+        // tier 3 had been waiting for, dropped that path; tier 3's link
+        // request went out with no transport hop, and its proof came back
+        // 0.5 s after the link's establishment timeout. A link that cannot
+        // come up on the path drops it (`run_tier3`), so a stale one is
+        // asked for again on the next race.
+        if let Some(iface) = cached_path_iface_is_live(dest_hash, &candidates, true) {
+            return Ok(iface);
         }
 
         // Drop any cached path before racing — see `race_path` for rationale.
@@ -7042,11 +7062,21 @@ mod route_speed_tests {
         assert!(!candidates.contains("LORA_BITRATE_THRESHOLD"));
 
         let race = between("pub fn race_path_slow_route(", "/// Race a path-request on every online, non-LoRa interface");
+        // A path answered in this process is kept, before anything is
+        // dropped or asked for on the air.
+        let kept = race
+            .find("if let Some(iface) = cached_path_iface_is_live(dest_hash, &candidates, true) {\n            return Ok(iface);")
+            .expect("keeps a path answered in this process");
         let expire = race.find("Transport::expire_path(dest_hash);").expect("drops the cached path");
         let request = race
             .find("Transport::request_path(dest_hash, None, Some(iface.clone()), None, None);")
             .expect("asks for a fresh path");
-        assert!(expire < request);
+        assert!(kept < expire && expire < request);
+        // ...and a link that cannot come up on it drops it.
+        let tier3 = between("fn run_tier3(", "fn await_outcome(");
+        let closed = &tier3[tier3.find("send tier-3: link closed before established").expect("closed branch")..];
+        let closed = &closed[..closed.find("return false;").expect("returns")];
+        assert!(closed.contains("if slow_route {\n                    Transport::expire_path(dest);"), "{}", closed);
         assert!(race.contains("let candidates = slow_route_candidate_interfaces();"));
         assert!(race.contains("Duration::from_secs_f64(reticulum_rust::transport::PATH_REQUEST_TIMEOUT)"));
         assert!(!race.contains("LIVENESS_BUDGET"), "no 5-second budget over a slow route");
