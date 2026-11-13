@@ -1982,7 +1982,21 @@ impl AppLinks {
         std::thread::Builder::new()
             .name("app_links_persistent_open".into())
             .spawn(move || {
-                let iface = match if Self::persistent_requires_verified_session_path(&spec_for_open) {
+                // Over a slow route the race asks on every interface, LoRa
+                // included, keeps a path answered in this process, and waits
+                // as long as Reticulum's own path request does
+                // (`liveness::race_path_slow_route`): DESIGN_PRINCIPLES.md §1,
+                // "LoRa connections". The link then waits on its own events,
+                // as it always has. A node's route counts as slow until its
+                // link has measured it (`send_route_is_slow`). Until
+                // 2026-11-13 an iPad on an RNode had nothing to ask on ("no
+                // usable (online, non-LoRa) interface"), and a phone on
+                // Bluetooth to an RTNode gave RFed 5 s to answer over LoRa.
+                let verified = Self::persistent_requires_verified_session_path(&spec_for_open);
+                let slow_route = Self::send_route_is_slow(&dest_owned);
+                let iface = match if slow_route {
+                    liveness::race_path_slow_route(&dest_owned, verified)
+                } else if verified {
                     liveness::race_path_verified_this_session(&dest_owned, LIVENESS_BUDGET)
                 } else {
                     liveness::race_path(&dest_owned, LIVENESS_BUDGET)
@@ -2180,6 +2194,12 @@ impl AppLinks {
                                 false,
                                 false,
                             );
+                            // Over a slow route the race kept a path answered
+                            // in this process; a link that could not come up
+                            // on it drops it, so the next race asks again.
+                            if slow_route {
+                                Transport::expire_path(&dest_cb);
+                            }
                             AppLinks::emit_status(&dest_cb, APP_LINK_DISCONNECTED, None);
                         }
                     })));
@@ -7118,6 +7138,22 @@ mod route_speed_tests {
         assert!(ready.contains("liveness_candidate_interfaces()"), "a fast route is unchanged");
         let reopen = between("pub fn announce_received(dest_hash: &[u8]) {", "pub fn network_changed(");
         assert!(reopen.contains("if Self::status(dest_hash) == APP_LINK_ACTIVE {\n            return;"));
+    }
+
+    // The held link to RFed or a propagation node over a slow route: the slow
+    // race (2026-11-13: the iPad on an RNode had nothing to ask on, the phone
+    // on an RTNode gave RFed 5 s), and a link that cannot come up drops the
+    // path the race kept. A fast route keeps its race.
+    #[test]
+    fn the_rfed_link_over_a_slow_route_uses_the_slow_race() {
+        let held = between("fn establish_persistent(dest_hash: &[u8], spec: AppLinkSpec) {", "// ─── Three-tier send");
+        let slow = held.find("let slow_route = Self::send_route_is_slow(&dest_owned);").expect("classified first");
+        let race = held.find("liveness::race_path_slow_route(&dest_owned, verified)").expect("the slow race");
+        assert!(slow < race);
+        assert!(held.contains("liveness::race_path_verified_this_session(&dest_owned, LIVENESS_BUDGET)"), "fast route unchanged");
+        assert!(held.contains("liveness::race_path(&dest_owned, LIVENESS_BUDGET)"), "fast route unchanged");
+        let closed = &held[held.find("persistent open: link closed before active").expect("the closed branch")..];
+        assert!(closed.contains("if slow_route {\n                                Transport::expire_path(&dest_cb);"), "{}", &closed[..400]);
     }
 
     // The chain over a slow route takes the destination's turn, and passes
