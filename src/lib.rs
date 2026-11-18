@@ -4215,6 +4215,428 @@ impl AppLinks {
 // links (`FakeTiers`); §O8's advertisement case runs a real Resource's own
 // watchdog. All tests use short delays (ms) so the suite completes quickly.
 
+// ─── Addresses held for others to reach directly ─────────────────────────
+//
+// An address this device holds so that others can reach it directly, without
+// a node in between: an incoming Reticulum destination under an identity the
+// host gives, with its private key. It is registered once and kept until the
+// process exits, as Reticulum has no documented way to release an address
+// (RNS 1.5.2). It takes single packets, which it proves only on the host's
+// word; it answers requests on links to it; it may have ratchets; and it is
+// announced only when the host asks, on the interfaces the host names, never
+// on a clock. RFed-rust SPEC §17.15 holds one for each offline distro device,
+// and a lookup address that accepts no links.
+//
+// The sending side is here too: one packet to an address with a delivery
+// proof asked for ([`AppLinks::send_packet_to`]), or one request on a link
+// opened for it ([`AppLinks::request_once`]).
+
+/// The most data one packet to an address can carry: Reticulum's
+/// `ENCRYPTED_MDU`, 383 bytes at the default MTU.
+pub const SINGLE_PACKET_MAX: usize = reticulum_rust::packet::ENCRYPTED_MDU;
+
+/// What a held address does with a single packet. Given the plaintext, it
+/// answers `true` to prove the packet, so the sender's receipt concludes as
+/// delivered, or `false` to leave it unproved.
+pub type HeldPacketHandler = Arc<dyn Fn(&[u8]) -> bool + Send + Sync>;
+
+/// What a held address answers a request on a link with. It is given the
+/// request's data, the msgpack value the sender sent, and returns the answer
+/// as a msgpack-encoded value. Neither is wrapped again (Reticulum's
+/// `Link.request` sends the data as the value itself).
+pub type HeldRequestHandler = Arc<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync>;
+
+/// An address to hold ([`AppLinks::hold_address`]).
+pub struct HeldAddress {
+    /// The identity the address is held under, with its private key.
+    pub identity: Identity,
+    pub app_name: String,
+    pub aspects: Vec<String>,
+    /// The file its ratchets are kept in, or `None` for no ratchets.
+    pub ratchets_path: Option<String>,
+    /// Whether it accepts links, and so requests.
+    pub accepts_links: bool,
+    /// What Reticulum's answers to path requests for it carry, and what its
+    /// announces carry unless they are given something else.
+    pub default_app_data: Option<Vec<u8>>,
+    /// Single packets to it. With `None` it proves none.
+    pub on_packet: Option<HeldPacketHandler>,
+    /// Requests on links to it, by path.
+    pub requests: Vec<(String, HeldRequestHandler)>,
+}
+
+/// The held addresses by hash: the copy each one announces from. Reticulum
+/// keeps another copy, registered, which takes what arrives; the two share
+/// their ratchets.
+static HELD_ADDRESSES: Lazy<Mutex<HashMap<Vec<u8>, Destination>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// One single packet to a held address: the host's word on it, and a proof
+/// only when that word is yes. Returns whether the packet was proved.
+fn held_packet_received(
+    handler: &HeldPacketHandler,
+    plaintext: &[u8],
+    prove: impl FnOnce() -> Result<(), String>,
+) -> bool {
+    if !handler(plaintext) {
+        return false;
+    }
+    match prove() {
+        Ok(()) => true,
+        Err(e) => {
+            log(
+                &format!("[HELD] a packet the host took was not proved: {}", e),
+                reticulum_rust::LOG_WARNING,
+                false,
+                false,
+            );
+            false
+        }
+    }
+}
+
+/// A held address's request handler as Reticulum calls it: the request's
+/// data goes to the host as it came, and the host's answer goes back as it is.
+fn held_request_callback(handler: HeldRequestHandler) -> reticulum_rust::destination::RequestHandlerCallback {
+    Arc::new(move |_path: &str, data: &[u8], _request_id: &[u8], _remote, _link, _requested_at| handler(data))
+}
+
+/// What a one-off request comes to, in the order its events arrive.
+enum OnceEvent {
+    Up(LinkHandle),
+    Closed,
+    Answer(Vec<u8>),
+    Failed,
+}
+
+impl AppLinks {
+    /// Holds an address: registers it with Reticulum as an incoming
+    /// destination and returns its hash. An address already held is left as
+    /// it is, with what it was first given. Reticulum keeps it until the
+    /// process exits.
+    ///
+    /// Reticulum proves nothing to it by itself (`PROVE_NONE`). The host's
+    /// [`HeldPacketHandler`] runs on a thread of its own, and the packet is
+    /// proved only when it answers `true`, so a proof says the host has the
+    /// packet's content: the same outcome as Python RNS's `PROVE_APP`,
+    /// without holding Reticulum's inbound processing while the host decides.
+    pub fn hold_address(address: HeldAddress) -> Result<Vec<u8>, String> {
+        let HeldAddress {
+            identity,
+            app_name,
+            aspects,
+            ratchets_path,
+            accepts_links,
+            default_app_data,
+            on_packet,
+            requests,
+        } = address;
+        let mut destination =
+            Destination::new_inbound(Some(identity), DestinationType::Single, app_name, aspects)?;
+        let hash = destination.hash.clone();
+        let mut held = HELD_ADDRESSES
+            .lock()
+            .map_err(|_| "held addresses: lock poisoned".to_string())?;
+        if held.contains_key(&hash) {
+            return Ok(hash);
+        }
+        if let Some(path) = ratchets_path {
+            destination.enable_ratchets(path)?;
+        }
+        destination.set_accept_links(accepts_links);
+        destination.set_default_app_data(default_app_data);
+        destination.set_proof_strategy(reticulum_rust::destination::PROVE_NONE)?;
+        if let Some(handler) = on_packet {
+            // The copy that signs proofs: the address's own identity, taken
+            // before the callback is set so it holds no callback of its own.
+            let prover = destination.clone();
+            destination.set_packet_callback(Some(Arc::new(move |plaintext: &[u8], packet: &Packet| {
+                held_packet_received(&handler, plaintext, || packet.prove(Some(&prover)));
+            })));
+        }
+        for (path, handler) in requests {
+            destination.register_request_handler(
+                path,
+                Some(held_request_callback(handler)),
+                reticulum_rust::destination::ALLOW_ALL,
+                None,
+                false,
+            )?;
+        }
+        Transport::register_destination(destination.clone());
+        held.insert(hash.clone(), destination);
+        log(&format!("[HELD] holding {}", hexrep(&hash, false)), LOG_NOTICE, false, false);
+        Ok(hash)
+    }
+
+    /// Whether the address with this hash is held.
+    pub fn holds_address(hash: &[u8]) -> bool {
+        HELD_ADDRESSES.lock().map(|held| held.contains_key(hash)).unwrap_or(false)
+    }
+
+    /// Sets a held address's default app_data: what Reticulum's answers to
+    /// path requests for it carry, and what its announces carry unless they
+    /// are given something else.
+    pub fn set_held_app_data(hash: &[u8], app_data: Option<Vec<u8>>) -> Result<(), String> {
+        let mut held = HELD_ADDRESSES
+            .lock()
+            .map_err(|_| "held addresses: lock poisoned".to_string())?;
+        let destination = held
+            .get_mut(hash)
+            .ok_or_else(|| format!("{} is not held", hexrep(hash, false)))?;
+        destination.set_default_app_data(app_data.clone());
+        // Reticulum answers a path request from its registered copy, so that
+        // copy changes too.
+        if !Transport::update_registered_default_app_data(hash, app_data) {
+            return Err(format!("{} is not registered with Reticulum", hexrep(hash, false)));
+        }
+        Ok(())
+    }
+
+    /// Announces a held address once on each named interface that is up and
+    /// sends, with `app_data`, or with its default app_data for `None`.
+    /// Returns how many interfaces it was announced on: a name Reticulum does
+    /// not have, or an interface that is down, is passed over.
+    pub fn announce_held(hash: &[u8], app_data: Option<&[u8]>, interfaces: &[String]) -> Result<usize, String> {
+        let up: HashSet<String> = reticulum_rust::transport::get_state_snapshot()
+            .interfaces
+            .iter()
+            .filter(|i| i.out && i.online)
+            .map(|i| i.name.clone())
+            .collect();
+        let mut held = HELD_ADDRESSES
+            .lock()
+            .map_err(|_| "held addresses: lock poisoned".to_string())?;
+        let destination = held
+            .get_mut(hash)
+            .ok_or_else(|| format!("{} is not held", hexrep(hash, false)))?;
+        let mut announced = 0;
+        for name in interfaces {
+            if !up.contains(name) {
+                continue;
+            }
+            match destination.announce(app_data, false, Some(name.clone()), None, true) {
+                Ok(_) => announced += 1,
+                Err(e) => log(
+                    &format!("[HELD] announce of {} on {} failed: {}", hexrep(hash, false), name, e),
+                    reticulum_rust::LOG_WARNING,
+                    false,
+                    false,
+                ),
+            }
+        }
+        Ok(announced)
+    }
+
+    /// Sends `data` as one packet to the address that `identity`, `app_name`
+    /// and `aspects` make, with a delivery proof asked for. `on_proved` runs
+    /// when the proof comes, or `on_failed` when Reticulum's receipt for the
+    /// packet times out: one of them, once. Returns `Err`, and runs neither,
+    /// when the data does not fit one packet ([`SINGLE_PACKET_MAX`]), there
+    /// is no path to the address, or the packet could not be sent. Reticulum
+    /// encrypts the packet to the address's latest ratchet when it has heard
+    /// one.
+    pub fn send_packet_to(
+        identity: &Identity,
+        app_name: &str,
+        aspects: &[String],
+        data: &[u8],
+        on_proved: Arc<dyn Fn() + Send + Sync>,
+        on_failed: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<(), String> {
+        if data.len() > SINGLE_PACKET_MAX {
+            return Err(format!(
+                "{} bytes do not fit one packet ({} at most)",
+                data.len(),
+                SINGLE_PACKET_MAX
+            ));
+        }
+        let destination = Destination::new_outbound(
+            Some(identity.clone()),
+            DestinationType::Single,
+            app_name.to_string(),
+            aspects.to_vec(),
+        )?;
+        let hash = destination.hash.clone();
+        if !Transport::has_path(&hash) {
+            return Err(format!("no path to {}", hexrep(&hash, false)));
+        }
+        let mut packet = Packet::new(
+            Some(destination),
+            data.to_vec(),
+            packet::DATA,
+            packet::NONE,
+            BROADCAST,
+            packet::HEADER_1,
+            None,
+            None,
+            true,
+            0,
+        );
+        let receipt = packet
+            .send()?
+            .ok_or_else(|| format!("no receipt for the packet to {}", hexrep(&hash, false)))?;
+        let decided = Arc::new(AtomicBool::new(false));
+        {
+            let decided = decided.clone();
+            receipt.set_delivery_callback(Arc::new(move |_: &reticulum_rust::packet::PacketReceipt| {
+                if !decided.swap(true, Ordering::AcqRel) {
+                    on_proved();
+                }
+            }));
+        }
+        receipt.set_timeout_callback(Arc::new(move |_: &reticulum_rust::packet::PacketReceipt| {
+            if !decided.swap(true, Ordering::AcqRel) {
+                on_failed();
+            }
+        }));
+        Ok(())
+    }
+
+    /// Opens a link to the address that `identity`, `app_name` and `aspects`
+    /// make, sends one request on it with `data` (a msgpack value) and closes
+    /// the link. `on_answer` gets the answer, a msgpack-encoded value, or
+    /// `on_failed` runs when the link does not come up, closes first, or the
+    /// request fails: one of them, once, on a thread of its own. Returns
+    /// `Err`, and runs neither, when there is no path to the address.
+    ///
+    /// A route a link to the address has measured is what it measured. One
+    /// not measured yet counts as slow (DESIGN_PRINCIPLES.md §1, "LoRa
+    /// connections"): an address reached this way is usually across a mesh,
+    /// so the link's own establishment timeout decides, with no 5 s cut, and
+    /// the requests to one address over a slow route take turns, one link at
+    /// a time. The request's own timeout or the link's close ends the wait;
+    /// there is no clock of ours.
+    pub fn request_once(
+        identity: &Identity,
+        app_name: &str,
+        aspects: &[String],
+        path: &str,
+        data: Vec<u8>,
+        on_answer: Arc<dyn Fn(Vec<u8>) + Send + Sync>,
+        on_failed: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<(), String> {
+        let destination = Destination::new_outbound(
+            Some(identity.clone()),
+            DestinationType::Single,
+            app_name.to_string(),
+            aspects.to_vec(),
+        )?;
+        let hash = destination.hash.clone();
+        if !Transport::has_path(&hash) {
+            return Err(format!("no path to {}", hexrep(&hash, false)));
+        }
+        let path = path.to_string();
+        std::thread::Builder::new()
+            .name("app_links_request_once".into())
+            .spawn(move || match Self::run_request_once(destination, &hash, path, data) {
+                Some(answer) => on_answer(answer),
+                None => on_failed(),
+            })
+            .map_err(|e| format!("request thread: {}", e))?;
+        Ok(())
+    }
+
+    fn run_request_once(destination: Destination, hash: &[u8], path: String, data: Vec<u8>) -> Option<Vec<u8>> {
+        let slow_route = Self::route_speed(hash) != ROUTE_FAST;
+        let turn = if slow_route {
+            SLOW_ROUTE_TURNS.lock().ok().map(|mut turns| {
+                turns
+                    .entry(hash.to_vec())
+                    .or_insert_with(|| Arc::new(Mutex::new(())))
+                    .clone()
+            })
+        } else {
+            None
+        };
+        let _my_turn = turn.as_ref().map(|t| t.lock());
+
+        let link = match Link::new_outbound(destination, MODE_AES256_CBC) {
+            Ok(l) => l,
+            Err(e) => {
+                log(
+                    &format!("[HELD] request to {}: Link::new_outbound failed: {}", hexrep(hash, false), e),
+                    LOG_NOTICE,
+                    false,
+                    false,
+                );
+                return None;
+            }
+        };
+        let handle = LinkHandle::spawn(link);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<OnceEvent>(8);
+        {
+            let tx = tx.clone();
+            let dest = hash.to_vec();
+            handle.set_link_established_callback(Some(Arc::new(move |h: LinkHandle| {
+                // The link's own ping says whether the route is fast or slow
+                // for the next send to the address (`route_speed`).
+                if let Some(rtt) = h.snapshot().ok().and_then(|s| s.rtt) {
+                    AppLinks::note_route_rtt(&dest, rtt);
+                }
+                let _ = tx.send(OnceEvent::Up(h));
+            })));
+        }
+        {
+            let tx = tx.clone();
+            handle.set_link_closed_callback(Some(Arc::new(move |_: LinkHandle| {
+                let _ = tx.send(OnceEvent::Closed);
+            })));
+        }
+
+        // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+        // Refresh TCP tunnel bindings before LRREQ, as tier 3 does.
+        Transport::synthesize_tunnel_all_tcp();
+
+        if handle.initiate().is_err() {
+            return None;
+        }
+        let first = if slow_route {
+            rx.recv().ok()
+        } else {
+            rx.recv_timeout(LIVENESS_BUDGET).ok()
+        };
+        let up = match first {
+            Some(OnceEvent::Up(h)) => h,
+            _ => {
+                log(
+                    &format!("[HELD] request to {}: the link did not come up", hexrep(hash, false)),
+                    LOG_NOTICE,
+                    false,
+                    false,
+                );
+                handle.teardown();
+                return None;
+            }
+        };
+        let answered = {
+            let tx = tx.clone();
+            Arc::new(move |receipt: reticulum_rust::link::RequestReceipt| {
+                let _ = tx.send(match receipt.get_response() {
+                    Some(answer) => OnceEvent::Answer(answer.to_vec()),
+                    None => OnceEvent::Failed,
+                });
+            })
+        };
+        let failed = Arc::new(move |_: reticulum_rust::link::RequestReceipt| {
+            let _ = tx.send(OnceEvent::Failed);
+        });
+        if up.request(path, data, Some(answered), Some(failed), None).is_err() {
+            up.teardown();
+            return None;
+        }
+        let outcome = loop {
+            match rx.recv() {
+                Ok(OnceEvent::Answer(answer)) => break Some(answer),
+                Ok(OnceEvent::Up(_)) => continue,
+                Ok(OnceEvent::Failed) | Ok(OnceEvent::Closed) | Err(_) => break None,
+            }
+        };
+        up.teardown();
+        outcome
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7172,5 +7594,135 @@ mod route_speed_tests {
         ));
         let open = between("let verified = Self::ephemeral_requires_verified_session_path(&spec);", "Ok(iface) => Ok(iface),");
         assert!(open.contains("if Self::send_route_is_slow(&dest_owned) {\n                    liveness::race_path_slow_route(&dest_owned, verified)"));
+    }
+}
+
+#[cfg(test)]
+mod held_address_tests {
+    use super::*;
+
+    fn address(identity: Identity, aspects: &[&str], accepts_links: bool) -> HeldAddress {
+        HeldAddress {
+            identity,
+            app_name: "rfed".into(),
+            aspects: aspects.iter().map(|a| a.to_string()).collect(),
+            ratchets_path: None,
+            accepts_links,
+            default_app_data: Some(vec![0x90]),
+            on_packet: None,
+            requests: vec![],
+        }
+    }
+
+    #[test]
+    fn one_packet_carries_reticulums_encrypted_mdu() {
+        assert_eq!(SINGLE_PACKET_MAX, 383, "Reticulum's ENCRYPTED_MDU at the default MTU of 500");
+    }
+
+    #[test]
+    fn a_packet_is_proved_only_on_the_hosts_word() {
+        let yes: HeldPacketHandler = Arc::new(|_| true);
+        let no: HeldPacketHandler = Arc::new(|_| false);
+        let proved = AtomicBool::new(false);
+        assert!(!held_packet_received(&no, b"x", || {
+            proved.store(true, Ordering::SeqCst);
+            Ok(())
+        }));
+        assert!(!proved.load(Ordering::SeqCst), "a packet the host refused is never proved");
+        assert!(held_packet_received(&yes, b"x", || {
+            proved.store(true, Ordering::SeqCst);
+            Ok(())
+        }));
+        assert!(proved.load(Ordering::SeqCst));
+        assert!(
+            !held_packet_received(&yes, b"x", || Err("no way back".into())),
+            "a proof that could not be sent is no proof"
+        );
+    }
+
+    #[test]
+    fn the_host_gets_the_plaintext_as_it_came() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let s = seen.clone();
+        let handler: HeldPacketHandler = Arc::new(move |p| {
+            s.lock().unwrap().extend_from_slice(p);
+            true
+        });
+        held_packet_received(&handler, &[1, 2, 3], || Ok(()));
+        assert_eq!(*seen.lock().unwrap(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn a_request_and_its_answer_pass_through_unwrapped() {
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let g = got.clone();
+        // msgpack [true, false]: the answer the host makes, sent as it is.
+        let handler: HeldRequestHandler = Arc::new(move |data| {
+            g.lock().unwrap().extend_from_slice(data);
+            vec![0x92, 0xc3, 0xc2]
+        });
+        let callback = held_request_callback(handler);
+        // msgpack [bin "ab", bin "c"]: the value the sender sent.
+        let data = [0x92, 0xc4, 0x02, b'a', b'b', 0xc4, 0x01, b'c'];
+        let answer = callback("/distro/direct", &data, b"request-id", None, None, 0.0);
+        assert_eq!(answer, vec![0x92, 0xc3, 0xc2]);
+        assert_eq!(*got.lock().unwrap(), data.to_vec());
+    }
+
+    #[test]
+    fn holding_registers_the_address_once_under_its_hash() {
+        let identity = Identity::new(true);
+        let id_hash = identity.hash.clone().expect("identity hash");
+        let aspects = ["distro", "direct", "0123456789abcdef"];
+        let expected = Destination::hash(Some(&id_hash), "rfed", &aspects);
+        let hash = AppLinks::hold_address(address(identity.clone(), &aspects, true)).expect("held");
+        assert_eq!(hash, expected);
+        assert!(AppLinks::holds_address(&hash));
+        assert!(
+            Transport::update_registered_default_app_data(&hash, Some(vec![0x90])),
+            "registered with Reticulum"
+        );
+        assert_eq!(AppLinks::hold_address(address(identity, &aspects, false)).expect("again"), hash);
+        assert!(
+            HELD_ADDRESSES.lock().unwrap().get(&hash).unwrap().accepts_links(),
+            "an address held again keeps what it was first given"
+        );
+    }
+
+    #[test]
+    fn a_lookup_address_accepts_no_links() {
+        let hash = AppLinks::hold_address(address(Identity::new(true), &["distro", "direct"], false)).expect("held");
+        assert!(!HELD_ADDRESSES.lock().unwrap().get(&hash).unwrap().accepts_links());
+    }
+
+    #[test]
+    fn app_data_is_set_only_for_a_held_address() {
+        let hash = AppLinks::hold_address(address(Identity::new(true), &["distro", "direct", "00ff00ff00ff00ff"], true))
+            .expect("held");
+        AppLinks::set_held_app_data(&hash, Some(vec![0x92, 0xa1, b'a', 0xc3])).expect("set");
+        assert!(AppLinks::set_held_app_data(b"not held at all.", None).is_err());
+    }
+
+    #[test]
+    fn announcing_passes_over_interfaces_that_are_not_up() {
+        let hash = AppLinks::hold_address(address(Identity::new(true), &["distro", "direct", "1111222233334444"], true))
+            .expect("held");
+        assert_eq!(AppLinks::announce_held(&hash, None, &["no such interface".to_string()]).unwrap(), 0);
+        assert!(AppLinks::announce_held(b"not held at all.", None, &[]).is_err());
+    }
+
+    #[test]
+    fn a_send_that_cannot_start_fails_at_once_with_no_outcome() {
+        let identity = Identity::new(true);
+        let aspects: Vec<String> = ["distro", "direct", "aaaabbbbccccdddd"].iter().map(|a| a.to_string()).collect();
+        let never: Arc<dyn Fn() + Send + Sync> = Arc::new(|| panic!("no outcome runs for a send that never started"));
+        let never_answer: Arc<dyn Fn(Vec<u8>) + Send + Sync> = Arc::new(|_| panic!("no answer to a request never sent"));
+        let no_path = AppLinks::send_packet_to(&identity, "rfed", &aspects, b"x", never.clone(), never.clone());
+        assert!(no_path.unwrap_err().contains("no path"));
+        let too_big = vec![0u8; SINGLE_PACKET_MAX + 1];
+        let big = AppLinks::send_packet_to(&identity, "rfed", &aspects, &too_big, never.clone(), never.clone());
+        assert!(big.unwrap_err().contains("do not fit"));
+        let no_path = AppLinks::request_once(&identity, "rfed", &aspects, "/distro/direct", vec![0xc0], never_answer, never);
+        assert!(no_path.unwrap_err().contains("no path"));
     }
 }
